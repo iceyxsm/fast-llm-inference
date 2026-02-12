@@ -1,5 +1,6 @@
 /*
  * Inference Engine - Single forward pass and generation
+ * OPTIMIZED VERSION: Uses 6x16 ASM-style kernels
  */
 
 #include <stdio.h>
@@ -7,6 +8,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -19,6 +24,18 @@
 
 #include "model_loader.h"
 #include "dequantized_tensor.h"
+
+/* Use optimized kernels */
+#define USE_OPTIMIZED_MATMUL 1
+
+/* Global: max layers to use (0 = all) */
+int g_max_layers = 0;
+
+/* Enable prefetching for better memory performance */
+#define USE_PREFETCHING 1
+
+/* Enable non-temporal stores for large outputs */
+#define USE_STREAMING_STORES 1
 
 #define GELU_SCALING 0.7978845608f  /* sqrt(2/pi) */
 
@@ -184,63 +201,98 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
                  hidden_size, 1e-5f);
     }
     
-    /* Q, K, V projections using dequantized INT8 */
+    /* Q, K, V projections using optimized INT8 matmul kernels */
     for (int s = 0; s < seq_len; s++) {
-        /* Q projection */
+        float* norm_row = &normed[s * hidden_size];
+        float* q_row = &q[s * hidden_size];
+        float* k_row = &k[s * hidden_size];
+        float* v_row = &v[s * hidden_size];
+        
+        /* Q projection: [hidden] @ [hidden, hidden] -> [hidden] */
         if (model->q_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            matmul_dequantized_asm_style(norm_row, model->q_proj[layer_idx], q_row, 1, hidden_size, hidden_size);
+            #else
             for (int h = 0; h < hidden_size; h++) {
                 float sum = 0.0f;
                 const int8_t* w = model->q_proj[layer_idx]->weights;
                 float scale = model->q_proj[layer_idx]->scales[h];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += normed[s * hidden_size + d] * w[h * hidden_size + d] * scale;
+                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
                 }
-                q[s * hidden_size + h] = sum;
+                q_row[h] = sum;
             }
+            #endif
         }
         
         /* K projection */
         if (model->k_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            matmul_dequantized_asm_style(norm_row, model->k_proj[layer_idx], k_row, 1, hidden_size, hidden_size);
+            #else
             for (int h = 0; h < hidden_size; h++) {
                 float sum = 0.0f;
                 const int8_t* w = model->k_proj[layer_idx]->weights;
                 float scale = model->k_proj[layer_idx]->scales[h];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += normed[s * hidden_size + d] * w[h * hidden_size + d] * scale;
+                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
                 }
-                k[s * hidden_size + h] = sum;
+                k_row[h] = sum;
             }
+            #endif
         }
         
         /* V projection */
         if (model->v_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            matmul_dequantized_asm_style(norm_row, model->v_proj[layer_idx], v_row, 1, hidden_size, hidden_size);
+            #else
             for (int h = 0; h < hidden_size; h++) {
                 float sum = 0.0f;
                 const int8_t* w = model->v_proj[layer_idx]->weights;
                 float scale = model->v_proj[layer_idx]->scales[h];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += normed[s * hidden_size + d] * w[h * hidden_size + d] * scale;
+                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
                 }
-                v[s * hidden_size + h] = sum;
+                v_row[h] = sum;
             }
+            #endif
         }
     }
     
     /* Multi-head attention */
     compute_attention(q, k, v, attn_out, seq_len, num_heads, head_dim);
     
-    /* O projection */
+    /* O projection using optimized kernel */
     for (int s = 0; s < seq_len; s++) {
-        for (int h = 0; h < hidden_size; h++) {
-            float sum = 0.0f;
-            if (model->o_proj[layer_idx]) {
+        float* attn_row = &attn_out[s * hidden_size];
+        float* out_row = &hidden_states[s * hidden_size];
+        float* res_row = &residual[s * hidden_size];
+        
+        if (model->o_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            /* Compute O projection: [hidden] @ [hidden, hidden] -> [hidden] */
+            float o_out[4096]; /* Max hidden size */
+            matmul_dequantized_asm_style(attn_row, model->o_proj[layer_idx], o_out, 1, hidden_size, hidden_size);
+            /* Add residual */
+            for (int h = 0; h < hidden_size; h++) {
+                out_row[h] = res_row[h] + o_out[h];
+            }
+            #else
+            for (int h = 0; h < hidden_size; h++) {
+                float sum = 0.0f;
                 const int8_t* w = model->o_proj[layer_idx]->weights;
                 float scale = model->o_proj[layer_idx]->scales[h];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += attn_out[s * hidden_size + d] * w[h * hidden_size + d] * scale;
+                    sum += attn_row[d] * w[h * hidden_size + d] * scale;
                 }
+                out_row[h] = res_row[h] + sum;
             }
-            hidden_states[s * hidden_size + h] = residual[s * hidden_size + h] + sum;
+            #endif
+        } else {
+            for (int h = 0; h < hidden_size; h++) {
+                out_row[h] = res_row[h];
+            }
         }
     }
     
@@ -253,52 +305,86 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
                  hidden_size, 1e-5f);
     }
     
-    /* FFN: gate_proj and up_proj */
+    /* FFN: gate_proj and up_proj using optimized kernels */
     for (int s = 0; s < seq_len; s++) {
+        float* ff_row = &ff_normed[s * hidden_size];
+        float* gate_row = &gate[s * intermediate_size];
+        float* up_row = &up[s * intermediate_size];
+        
         /* Gate projection (SiLU) */
         if (model->gate_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            matmul_dequantized_asm_style(ff_row, model->gate_proj[layer_idx], gate_row, 1, intermediate_size, hidden_size);
+            /* Apply SiLU activation */
+            for (int i = 0; i < intermediate_size; i++) {
+                gate_row[i] = silu(gate_row[i]);
+            }
+            #else
             for (int i = 0; i < intermediate_size; i++) {
                 float sum = 0.0f;
                 const int8_t* w = model->gate_proj[layer_idx]->weights;
                 float scale = model->gate_proj[layer_idx]->scales[i];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += ff_normed[s * hidden_size + d] * w[i * hidden_size + d] * scale;
+                    sum += ff_row[d] * w[i * hidden_size + d] * scale;
                 }
-                gate[s * intermediate_size + i] = silu(sum);
+                gate_row[i] = silu(sum);
             }
+            #endif
         }
         
         /* Up projection */
         if (model->up_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            matmul_dequantized_asm_style(ff_row, model->up_proj[layer_idx], up_row, 1, intermediate_size, hidden_size);
+            #else
             for (int i = 0; i < intermediate_size; i++) {
                 float sum = 0.0f;
                 const int8_t* w = model->up_proj[layer_idx]->weights;
                 float scale = model->up_proj[layer_idx]->scales[i];
                 for (int d = 0; d < hidden_size; d++) {
-                    sum += ff_normed[s * hidden_size + d] * w[i * hidden_size + d] * scale;
+                    sum += ff_row[d] * w[i * hidden_size + d] * scale;
                 }
-                up[s * intermediate_size + i] = sum;
+                up_row[i] = sum;
             }
+            #endif
         }
         
         /* Element-wise multiply (SwiGLU) */
         for (int i = 0; i < intermediate_size; i++) {
-            gate[s * intermediate_size + i] *= up[s * intermediate_size + i];
+            gate_row[i] *= up_row[i];
         }
     }
     
-    /* Down projection */
+    /* Down projection using optimized kernel */
     for (int s = 0; s < seq_len; s++) {
-        for (int h = 0; h < hidden_size; h++) {
-            float sum = 0.0f;
-            if (model->down_proj[layer_idx]) {
+        float* gate_row = &gate[s * intermediate_size];
+        float* out_row = &hidden_states[s * hidden_size];
+        float* res_row = &residual[s * hidden_size];
+        
+        if (model->down_proj[layer_idx]) {
+            #if USE_OPTIMIZED_MATMUL
+            /* Compute down projection: [intermediate] @ [hidden, intermediate] -> [hidden] */
+            float down_out[4096]; /* Max hidden size */
+            matmul_dequantized_asm_style(gate_row, model->down_proj[layer_idx], down_out, 1, hidden_size, intermediate_size);
+            /* Add residual */
+            for (int h = 0; h < hidden_size; h++) {
+                out_row[h] = res_row[h] + down_out[h];
+            }
+            #else
+            for (int h = 0; h < hidden_size; h++) {
+                float sum = 0.0f;
                 const int8_t* w = model->down_proj[layer_idx]->weights;
                 float scale = model->down_proj[layer_idx]->scales[h];
                 for (int i = 0; i < intermediate_size; i++) {
-                    sum += gate[s * intermediate_size + i] * w[h * intermediate_size + i] * scale;
+                    sum += gate_row[i] * w[h * intermediate_size + i] * scale;
                 }
+                out_row[h] = res_row[h] + sum;
             }
-            hidden_states[s * hidden_size + h] = residual[s * hidden_size + h] + sum;
+            #endif
+        } else {
+            for (int h = 0; h < hidden_size; h++) {
+                out_row[h] = res_row[h];
+            }
         }
     }
     
@@ -322,6 +408,11 @@ void model_forward(transformer_model_t* model,
     int hidden_size = model->config.hidden_size;
     int vocab_size = model->config.vocab_size;
     int num_layers = model->config.num_layers;
+    
+    /* Apply layer reduction if configured */
+    if (g_max_layers > 0 && g_max_layers < num_layers) {
+        num_layers = g_max_layers;
+    }
     
     /* Allocate hidden states */
     float* hidden_states = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
@@ -347,22 +438,28 @@ void model_forward(transformer_model_t* model,
                  hidden_size, 1e-5f);
     }
     
-    /* LM head projection */
+    /* LM head projection using optimized kernel */
     float* logits = aligned_malloc(vocab_size * sizeof(float), 32);
     
     /* Use last token for next token prediction */
     float* last_hidden = &normed[(seq_len - 1) * hidden_size];
     
-    for (int v = 0; v < vocab_size; v++) {
-        float sum = 0.0f;
-        if (model->lm_head) {
+    if (model->lm_head) {
+        #if USE_OPTIMIZED_MATMUL
+        matmul_dequantized_asm_style(last_hidden, model->lm_head, logits, 1, vocab_size, hidden_size);
+        #else
+        for (int v = 0; v < vocab_size; v++) {
+            float sum = 0.0f;
             const int8_t* w = model->lm_head->weights;
             float scale = model->lm_head->scales[v];
             for (int d = 0; d < hidden_size; d++) {
                 sum += last_hidden[d] * w[v * hidden_size + d] * scale;
             }
+            logits[v] = sum;
         }
-        logits[v] = sum;
+        #endif
+    } else {
+        memset(logits, 0, vocab_size * sizeof(float));
     }
     
     /* Copy to output */

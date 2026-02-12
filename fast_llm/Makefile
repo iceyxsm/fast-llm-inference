@@ -3,7 +3,7 @@
 
 # Compiler
 CC = gcc
-CFLAGS = -O3 -Wall -Wextra -fPIC -fopenmp -ffast-math -Iinclude
+CFLAGS = -O3 -Wall -Wextra -fPIC -fopenmp -ffast-math -mavx2 -mfma -Iinclude
 LDFLAGS = -lm -fopenmp
 
 # Detect OS
@@ -21,12 +21,26 @@ HAVE_AVX512 := $(shell echo | $(CC) -mavx512f -E - > /dev/null 2>&1 && echo 1 ||
 
 # Source files - PURE C, NO PYTHON
 SRCS = src/main.c \
+       src/inference.c \
+       src/gguf_loader.c \
        src/kernels/cpu_features.c \
        src/kernels/quant.c \
        src/kernels/matmul_scalar.c \
+       src/kernels/matmul_best.c \
+       src/kernels/matmul_asm_style.c \
+       src/kernels/matmul_large_n.c \
        src/kernels/kernel_dispatch.c \
        src/kernels/matmul_amx.c \
-       src/kernels/matmul_vnni.c
+       src/kernels/matmul_vnni.c \
+       src/kernels/dequantized_tensor.c \
+       src/kernels/matmul_avx2.c \
+       src/kernels/ggml_quants.c \
+       src/kernels/matmul_q4.c \
+       src/kernels/matmul_q4_k_optimized.c \
+       src/kernels/matmul_q4_k_avx2.c \
+       src/kernels/matmul_prefetch_optimized.c \
+       src/kernels/matmul_int8_vnni.c \
+       src/kernels/fused_swiglu_rms.c
 
 # Add AVX-512 kernels if supported
 ifeq ($(HAVE_AVX512),1)
@@ -71,6 +85,17 @@ test-q4: $(TARGET)
 # Run benchmark with Q8
 test-q8: $(TARGET)
 	./$(TARGET) --benchmark --quant 8
+
+# 50 tok/sec benchmark
+bench-50tok: src/kernels/matmul_asm_style.o src/kernels/matmul_large_n.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/matmul_scalar.o
+	$(CC) -O3 -mavx2 -mfma -fopenmp -ffast-math -Iinclude \
+	    bench_50tok_final.c \
+	    src/kernels/matmul_asm_style.o src/kernels/matmul_large_n.o \
+	    src/kernels/cpu_features.o src/kernels/quant.o \
+	    src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o \
+	    src/kernels/matmul_scalar.o \
+	    -o bench_50tok.exe -lm -fopenmp
+	@echo "Built: bench_50tok.exe"
 
 # Print info
 info:

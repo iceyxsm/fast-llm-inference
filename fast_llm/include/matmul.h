@@ -80,6 +80,28 @@ matmul_fn_t select_q2_kernel(const cpu_features_t* features);
 matmul_fn_t select_q4_kernel(const cpu_features_t* features);
 matmul_fn_t select_q8_kernel(const cpu_features_t* features);
 
+/* 
+ * AVX2 optimized kernels
+ */
+void q2_matmul_avx2(const float* A, const quantized_tensor_t* B, float* C,
+                    int M, int N, int K);
+void q4_matmul_avx2(const float* A, const quantized_tensor_t* B, float* C,
+                    int M, int N, int K);
+void q8_matmul_avx2(const float* A, const quantized_tensor_t* B, float* C,
+                    int M, int N, int K);
+void q4_matmul_single_token(const float* A, const quantized_tensor_t* B, float* C,
+                            int M, int N, int K);
+
+/* 
+ * AVX-512 stubs (fallback to AVX2)
+ */
+void q2_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K);
+void q4_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K);
+void q8_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K);
+
 #ifdef __cplusplus
 }
 #endif

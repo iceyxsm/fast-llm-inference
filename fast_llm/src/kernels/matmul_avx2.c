@@ -202,6 +202,29 @@ void q2_matmul_avx2(const float* A, const quantized_tensor_t* B_q, float* C,
     }
 }
 
+/* Alias for single-token inference (optimized for M=1) */
+void q4_matmul_single_token(const float* A, const quantized_tensor_t* B, float* C,
+                            int M, int N, int K) {
+    /* For now, use the standard AVX2 implementation */
+    q4_matmul_avx2(A, B, C, M, N, K);
+}
+
+/* Stubs for AVX-512 functions (fallback to AVX2) */
+void q2_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q2_matmul_avx2(A, B, C, M, N, K);
+}
+
+void q4_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q4_matmul_avx2(A, B, C, M, N, K);
+}
+
+void q8_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q8_matmul_avx2(A, B, C, M, N, K);
+}
+
 #else /* !__AVX2__ */
 
 /* Fallback to scalar if AVX2 not available at compile time */
@@ -218,6 +241,27 @@ void q4_matmul_avx2(const float* A, const quantized_tensor_t* B, float* C,
 void q2_matmul_avx2(const float* A, const quantized_tensor_t* B, float* C,
                     int M, int N, int K) {
     q2_matmul(A, B, C, M, N, K);
+}
+
+/* Stubs for non-AVX2 builds */
+void q4_matmul_single_token(const float* A, const quantized_tensor_t* B, float* C,
+                            int M, int N, int K) {
+    q4_matmul(A, B, C, M, N, K);
+}
+
+void q2_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q2_matmul(A, B, C, M, N, K);
+}
+
+void q4_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q4_matmul(A, B, C, M, N, K);
+}
+
+void q8_matmul_avx512(const float* A, const quantized_tensor_t* B, float* C,
+                      int M, int N, int K) {
+    q8_matmul(A, B, C, M, N, K);
 }
 
 #endif /* __AVX2__ */

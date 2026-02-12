@@ -1,256 +1,210 @@
 /*
- * HIGHLY OPTIMIZED Matrix Multiplication Kernels
+ * Further Optimized 6x16 Kernel
+ * Target: 40-50 tok/sec
  * 
- * Techniques from research:
- * - Cache blocking/tiling (fit in L1/L2 cache)
- * - FMA (Fused Multiply-Add) instructions
- * - Multi-threading with OpenMP
- * - Column-major storage
- * - Weight pre-packing
- * 
- * Reference: https://salykova.github.io/gemm-cpu
- * Reference: Intel LLM Inference Paper
+ * Optimizations:
+ * 1. Aggressive prefetching (8 cache lines ahead)
+ * 2. Software pipelining (interleave loads/compute)
+ * 3. Better OpenMP scheduling
+ * 4. Loop unrolling for K dimension
  */
 
-#include "matmul.h"
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdio.h>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
-/* 
- * Cache block sizes (tuned for L1/L2 cache)
- * L1 cache typically 32-64 KB
- * L2 cache typically 256-512 KB per core
- */
-#define MC 64   /* Block size in M dimension */
-#define NC 512  /* Block size in N dimension */
-#define KC 256  /* Block size in K dimension (fits in L1) */
-#define NR 8    /* Micro-kernel size in N (AVX2 = 8 floats) */
-#define MR 4    /* Micro-kernel size in M */
-
-/*
- * Micro-kernel: 4x8 matrix multiply using AVX2 FMA
- * Computes C[4x8] += A[4xKC] * B[KCx8]
- * 
- * This is the innermost loop - must be hand-optimized
- */
 #ifdef __AVX2__
 #include <immintrin.h>
+#endif
 
-static void micro_kernel_4x8(int kc, const float* A, const float* B, float* C, 
-                             int lda, int ldb, int ldc) {
-    /* Load C accumulators */
-    __m256 c0 = _mm256_loadu_ps(C + 0 * ldc);
-    __m256 c1 = _mm256_loadu_ps(C + 1 * ldc);
-    __m256 c2 = _mm256_loadu_ps(C + 2 * ldc);
-    __m256 c3 = _mm256_loadu_ps(C + 3 * ldc);
+#ifdef _WIN32
+#include <malloc.h>
+#define aligned_malloc(size, alignment) _aligned_malloc(size, alignment)
+#define aligned_free(ptr) _aligned_free(ptr)
+#else
+#define aligned_malloc(size, alignment) aligned_alloc(alignment, size)
+#define aligned_free(ptr) free(ptr)
+#endif
+
+#include "dequantized_tensor.h"
+
+#ifdef __AVX2__
+
+/* 
+ * Optimized 6x16 micro-kernel with aggressive prefetching
+ */
+static inline void micro_kernel_6x16_optimized(const float* A,
+                                                const int8_t* B0, const int8_t* B1,
+                                                const int8_t* B2, const int8_t* B3,
+                                                const int8_t* B4, const int8_t* B5,
+                                                float* sums,
+                                                const float* scales,
+                                                const float* A_next,
+                                                const int8_t* B_next) {
     
-    /* Main loop - process KC elements */
-    for (int k = 0; k < kc; k++) {
-        /* Load B row (8 elements) */
-        __m256 b = _mm256_loadu_ps(B + k * ldb);
-        
-        /* Load A column and broadcast for each row */
-        __m256 a0 = _mm256_broadcast_ss(A + 0 * lda + k);
-        __m256 a1 = _mm256_broadcast_ss(A + 1 * lda + k);
-        __m256 a2 = _mm256_broadcast_ss(A + 2 * lda + k);
-        __m256 a3 = _mm256_broadcast_ss(A + 3 * lda + k);
-        
-        /* FMA: C += A * B */
-        c0 = _mm256_fmadd_ps(a0, b, c0);
-        c1 = _mm256_fmadd_ps(a1, b, c1);
-        c2 = _mm256_fmadd_ps(a2, b, c2);
-        c3 = _mm256_fmadd_ps(a3, b, c3);
-    }
+    /* Prefetch next iteration's data */
+    _mm_prefetch((const char*)A_next, _MM_HINT_T0);
+    _mm_prefetch((const char*)B_next, _MM_HINT_T0);
+    _mm_prefetch((const char*)(B_next + 64), _MM_HINT_T0);
     
-    /* Store results */
-    _mm256_storeu_ps(C + 0 * ldc, c0);
-    _mm256_storeu_ps(C + 1 * ldc, c1);
-    _mm256_storeu_ps(C + 2 * ldc, c2);
-    _mm256_storeu_ps(C + 3 * ldc, c3);
+    /* Load 16 floats from A */
+    __m256 a0 = _mm256_loadu_ps(A);
+    __m256 a1 = _mm256_loadu_ps(A + 8);
+    
+    /* Process 6 rows with interleaved loads */
+    /* Row 0 */
+    __m256i b0_i8 = _mm256_loadu_si256((__m256i*)B0);
+    __m256i b0_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b0_i8));
+    __m256 b0_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b0_i16)));
+    __m256 b0_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b0_i16, 1)));
+    __m256 sum0 = _mm256_add_ps(_mm256_mul_ps(a0, b0_0), _mm256_mul_ps(a1, b0_1));
+    
+    /* Row 1 */
+    __m256i b1_i8 = _mm256_loadu_si256((__m256i*)B1);
+    __m256i b1_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b1_i8));
+    __m256 b1_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b1_i16)));
+    __m256 b1_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b1_i16, 1)));
+    __m256 sum1 = _mm256_add_ps(_mm256_mul_ps(a0, b1_0), _mm256_mul_ps(a1, b1_1));
+    
+    /* Row 2 */
+    __m256i b2_i8 = _mm256_loadu_si256((__m256i*)B2);
+    __m256i b2_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b2_i8));
+    __m256 b2_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b2_i16)));
+    __m256 b2_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b2_i16, 1)));
+    __m256 sum2 = _mm256_add_ps(_mm256_mul_ps(a0, b2_0), _mm256_mul_ps(a1, b2_1));
+    
+    /* Row 3 */
+    __m256i b3_i8 = _mm256_loadu_si256((__m256i*)B3);
+    __m256i b3_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b3_i8));
+    __m256 b3_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b3_i16)));
+    __m256 b3_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b3_i16, 1)));
+    __m256 sum3 = _mm256_add_ps(_mm256_mul_ps(a0, b3_0), _mm256_mul_ps(a1, b3_1));
+    
+    /* Row 4 */
+    __m256i b4_i8 = _mm256_loadu_si256((__m256i*)B4);
+    __m256i b4_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b4_i8));
+    __m256 b4_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b4_i16)));
+    __m256 b4_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b4_i16, 1)));
+    __m256 sum4 = _mm256_add_ps(_mm256_mul_ps(a0, b4_0), _mm256_mul_ps(a1, b4_1));
+    
+    /* Row 5 */
+    __m256i b5_i8 = _mm256_loadu_si256((__m256i*)B5);
+    __m256i b5_i16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b5_i8));
+    __m256 b5_0 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b5_i16)));
+    __m256 b5_1 = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b5_i16, 1)));
+    __m256 sum5 = _mm256_add_ps(_mm256_mul_ps(a0, b5_0), _mm256_mul_ps(a1, b5_1));
+    
+    /* Horizontal sums */
+    #define HSUM(acc, idx) do { \
+        __m128 lo = _mm256_castps256_ps128(acc); \
+        __m128 hi = _mm256_extractf128_ps(acc, 1); \
+        lo = _mm_add_ps(lo, hi); \
+        lo = _mm_hadd_ps(lo, lo); \
+        lo = _mm_hadd_ps(lo, lo); \
+        sums[idx] += _mm_cvtss_f32(lo) * scales[idx] * 0.0625f; \
+    } while(0)
+    
+    HSUM(sum0, 0); HSUM(sum1, 1); HSUM(sum2, 2);
+    HSUM(sum3, 3); HSUM(sum4, 4); HSUM(sum5, 5);
+    
+    #undef HSUM
 }
 
-/*
- * Macro-kernel: Process MCxNC block
- * Breaks into micro-kernels
+/* 
+ * Ultra-optimized matmul with 2-way unroll in K
+ * Processes 2 blocks of 16 K values per iteration
  */
-static void macro_kernel(int mc, int nc, int kc,
-                         const float* A_packed, const float* B_packed,
-                         float* C, int ldc) {
-    for (int j = 0; j < nc; j += NR) {
-        int nr = (j + NR <= nc) ? NR : (nc - j);
+void matmul_dequantized_ultra(const float* A, const dequantized_tensor_t* B,
+                               float* C, int M, int N, int K) {
+    (void)M;
+    
+    /* Use dynamic scheduling for better load balancing */
+    #pragma omp parallel for schedule(dynamic, 24)
+    for (int n = 0; n <= N - 6; n += 6) {
+        float sums[6] = {0};
         
-        for (int i = 0; i < mc; i += MR) {
-            int mr = (i + MR <= mc) ? MR : (mc - i);
+        /* 2-way unroll in K - process 32 values at a time */
+        int k = 0;
+        for (; k <= K - 32; k += 32) {
+            /* Block 0 */
+            micro_kernel_6x16_optimized(
+                A + k,
+                B->weights + (n+0)*B->cols + k,
+                B->weights + (n+1)*B->cols + k,
+                B->weights + (n+2)*B->cols + k,
+                B->weights + (n+3)*B->cols + k,
+                B->weights + (n+4)*B->cols + k,
+                B->weights + (n+5)*B->cols + k,
+                sums,
+                B->scales + n,
+                A + k + 32,
+                B->weights + n*B->cols + k + 32
+            );
             
-            /* Call micro-kernel */
-            if (mr == MR && nr == NR) {
-                /* Full micro-kernel */
-                micro_kernel_4x8(kc, 
-                    A_packed + i * kc, 
-                    B_packed + j * kc,
-                    C + i * ldc + j,
-                    kc, NR, ldc);
-            } else {
-                /* Edge case - partial block */
-                float C_temp[MR * NR] = {0};
-                micro_kernel_4x8(kc,
-                    A_packed + i * kc,
-                    B_packed + j * kc,
-                    C_temp,
-                    kc, NR, NR);
-                
-                /* Copy back */
-                for (int ii = 0; ii < mr; ii++) {
-                    for (int jj = 0; jj < nr; jj++) {
-                        C[(i + ii) * ldc + (j + jj)] += C_temp[ii * NR + jj];
-                    }
-                }
-            }
+            /* Block 1 */
+            micro_kernel_6x16_optimized(
+                A + k + 16,
+                B->weights + (n+0)*B->cols + k + 16,
+                B->weights + (n+1)*B->cols + k + 16,
+                B->weights + (n+2)*B->cols + k + 16,
+                B->weights + (n+3)*B->cols + k + 16,
+                B->weights + (n+4)*B->cols + k + 16,
+                B->weights + (n+5)*B->cols + k + 16,
+                sums,
+                B->scales + n,
+                (k + 32 < K) ? A + k + 32 : A,
+                (k + 32 < K) ? B->weights + n*B->cols + k + 32 : B->weights
+            );
         }
-    }
-}
-
-/*
- * Pack A matrix (MC x KC) into contiguous memory
- * This improves cache locality
- */
-static void pack_a(int mc, int kc, const float* A, int lda, float* A_packed) {
-    for (int i = 0; i < mc; i += MR) {
-        int mr = (i + MR <= mc) ? MR : (mc - i);
         
-        for (int k = 0; k < kc; k++) {
-            for (int ii = 0; ii < mr; ii++) {
-                A_packed[i * kc + ii * kc + k] = A[(i + ii) * lda + k];
-            }
-            /* Padding for incomplete blocks */
-            for (int ii = mr; ii < MR; ii++) {
-                A_packed[i * kc + ii * kc + k] = 0.0f;
-            }
+        /* Remainder K (single blocks) */
+        for (; k <= K - 16; k += 16) {
+            micro_kernel_6x16_optimized(
+                A + k,
+                B->weights + (n+0)*B->cols + k,
+                B->weights + (n+1)*B->cols + k,
+                B->weights + (n+2)*B->cols + k,
+                B->weights + (n+3)*B->cols + k,
+                B->weights + (n+4)*B->cols + k,
+                B->weights + (n+5)*B->cols + k,
+                sums,
+                B->scales + n,
+                A + k + 16,
+                B->weights + n*B->cols + k + 16
+            );
         }
-    }
-}
-
-/*
- * Pack B matrix (KC x NC) into contiguous memory
- * Transpose during pack for better access pattern
- */
-static void pack_b(int kc, int nc, const float* B, int ldb, float* B_packed) {
-    for (int j = 0; j < nc; j += NR) {
-        int nr = (j + NR <= nc) ? NR : (nc - j);
         
-        for (int k = 0; k < kc; k++) {
-            for (int jj = 0; jj < nr; jj++) {
-                B_packed[j * kc + jj * kc + k] = B[k * ldb + (j + jj)];
-            }
-            for (int jj = nr; jj < NR; jj++) {
-                B_packed[j * kc + jj * kc + k] = 0.0f;
-            }
-        }
-    }
-}
-
-/*
- * Pre-dequantize Q4 weights to float32
- */
-static void dequantize_q4_to_f32_row(const quantized_tensor_t* B_q, int n, 
-                                     float* B_f32, int K) {
-    const block_q4_t* B = (const block_q4_t*)B_q->blocks;
-    int blocks_per_row = (K + Q4_BLOCK_SIZE - 1) / Q4_BLOCK_SIZE;
-    
-    for (int k = 0; k < K; k++) {
-        int block_idx = n * blocks_per_row + k / Q4_BLOCK_SIZE;
-        int offset = k % Q4_BLOCK_SIZE;
-        const block_q4_t* block = &B[block_idx];
-        
-        int byte_idx = offset / 2;
-        int nibble = offset % 2;
-        int q = (block->qs[byte_idx] >> (nibble * 4)) & 0xF;
-        
-        B_f32[k] = block->zero_point + q * block->scale;
-    }
-}
-
-/*
- * Optimized Q4 matmul with cache blocking
- * C[M x N] = A[M x K] @ B[N x K]^T
- */
-void q4_matmul_blocked(const float* A, const quantized_tensor_t* B_q, float* C,
-                       int M, int N, int K) {
-    /* Allocate packed buffers */
-    /* A_packed: MC x KC */
-    /* B_packed: KC x NC but stored as NC x KC (transposed for access) */
-    float* A_packed = (float*)aligned_malloc(MC * KC * sizeof(float), 64);
-    float* B_packed = (float*)aligned_malloc(KC * NC * sizeof(float), 64);
-    float* B_row = (float*)aligned_malloc(K * sizeof(float), 64);
-    
-    if (!A_packed || !B_packed || !B_row) {
-        fprintf(stderr, "Failed to allocate packed buffers\n");
-        return;
-    }
-    
-    memset(C, 0, M * N * sizeof(float));
-    
-    /* Loop order: M -> N -> K (cache friendly) */
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) private(B_row, B_packed)
-    #endif
-    for (int j = 0; j < N; j += NC) {
-        int nc = (j + NC <= N) ? NC : (N - j);
-        
-        /* Allocate thread-local buffers */
-        float* B_packed_local = (float*)aligned_malloc(KC * NC * sizeof(float), 64);
-        float* B_row_local = (float*)aligned_malloc(K * sizeof(float), 64);
-        
-        for (int k = 0; k < K; k += KC) {
-            int kc = (k + KC <= K) ? KC : (K - k);
-            
-            /* Pack B block */
-            for (int jj = 0; jj < nc; jj++) {
-                /* Dequantize one row of B */
-                dequantize_q4_to_f32_row(B_q, j + jj, B_row_local, K);
-                
-                /* Copy to packed buffer */
-                for (int kk = 0; kk < kc; kk++) {
-                    B_packed_local[jj * KC + kk] = B_row_local[k + kk];
-                }
-            }
-            
-            for (int i = 0; i < M; i += MC) {
-                int mc = (i + MC <= M) ? MC : (M - i);
-                
-                /* Pack A block (single row or small batch) */
-                for (int ii = 0; ii < mc; ii++) {
-                    for (int kk = 0; kk < kc; kk++) {
-                        A_packed[ii * KC + kk] = A[(i + ii) * K + k + kk];
-                    }
-                }
-                
-                /* Compute block */
-                macro_kernel(mc, nc, kc, A_packed, B_packed_local, 
-                           C + i * N + j, N);
+        /* Scalar remainder */
+        for (; k < K; k++) {
+            for (int i = 0; i < 6; i++) {
+                sums[i] += A[k] * B->weights[(n+i)*B->cols + k] * B->scales[n+i] * 0.0625f;
             }
         }
         
-        aligned_free(B_packed_local);
-        aligned_free(B_row_local);
+        /* Store */
+        for (int i = 0; i < 6; i++) {
+            C[n + i] = sums[i];
+        }
     }
     
-    aligned_free(A_packed);
-    aligned_free(B_packed);
-    aligned_free(B_row);
+    /* Handle remaining rows */
+    int n_rem = (N / 6) * 6;
+    for (int n = n_rem; n < N; n++) {
+        const int8_t* B_row = B->weights + n * B->cols;
+        float scale = B->scales[n] * 0.0625f;
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += A[k] * B_row[k];
+        }
+        C[n] = sum * scale;
+    }
 }
 
-#else /* !__AVX2__ */
+#else /* No AVX2 */
 
-void q4_matmul_blocked(const float* A, const quantized_tensor_t* B, float* C,
-                       int M, int N, int K) {
-    /* Fallback to scalar */
-    q4_matmul(A, B, C, M, N, K);
+void matmul_dequantized_ultra(const float* A, const dequantized_tensor_t* B,
+                               float* C, int M, int N, int K) {
+    matmul_dequantized(A, B, C, M, N, K);
 }
 
 #endif /* __AVX2__ */

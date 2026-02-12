@@ -34,6 +34,7 @@ typedef struct {
     int max_tokens;
     float temperature;
     int num_threads;
+    int num_layers;      /* Number of layers to use (0 = all) */
     bool benchmark;
     int quant_bits;
     bool use_mock;
@@ -51,6 +52,7 @@ void print_usage(const char* prog) {
     printf("  -t, --temp <float>      Temperature (default: 0.8)\n");
     printf("  --threads <n>           Number of threads (default: auto)\n");
     printf("  -q, --quant <bits>      Quantization: 2, 4, or 8 (default: 4)\n");
+    printf("  --layers <n>            Number of layers to use (default: 32, try 20 for speed)\n");
     printf("  --mock                  Use mock model for testing\n");
     printf("  -b, --benchmark         Run benchmark\n");
     printf("  -v, --verbose           Verbose output\n");
@@ -65,6 +67,7 @@ cli_args_t parse_args(int argc, char** argv) {
         .max_tokens = 100,
         .temperature = 0.8f,
         .num_threads = 0,
+        .num_layers = 0,  /* 0 = use all layers in model */
         .benchmark = false,
         .quant_bits = 4,
         .use_mock = false,
@@ -82,6 +85,8 @@ cli_args_t parse_args(int argc, char** argv) {
             if (++i < argc) args.temperature = atof(argv[i]);
         } else if (strcmp(argv[i], "--threads") == 0) {
             if (++i < argc) args.num_threads = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--layers") == 0) {
+            if (++i < argc) args.num_layers = atoi(argv[i]);
         } else if (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quant") == 0) {
             if (++i < argc) args.quant_bits = atoi(argv[i]);
         } else if (strcmp(argv[i], "--mock") == 0) {
@@ -287,6 +292,13 @@ int main(int argc, char** argv) {
     printf("                                             |___/     \n");
     printf("        Pure C LLM Inference Engine\n");
     printf("        INT8 + AVX2 + Speculative + Medusa\n\n");
+    
+    /* Apply layer reduction if specified */
+    if (args.num_layers > 0) {
+        extern int g_max_layers;
+        g_max_layers = args.num_layers;
+        printf("Using %d layers (reduced from 32)\n\n", args.num_layers);
+    }
     
     if (args.benchmark) {
         run_benchmark(&args);

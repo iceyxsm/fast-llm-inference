@@ -53,6 +53,21 @@ void matmul_dequantized(const float* A, const dequantized_tensor_t* B,
 void matmul_dequantized_avx2(const float* A, const dequantized_tensor_t* B,
                              float* C, int M, int N, int K);
 
+/* 
+ * Assembly-style optimized kernel (6x16 micro-kernel)
+ * Highest performance for single-token inference
+ * Uses aggressive prefetching and register blocking
+ */
+void matmul_dequantized_asm_style(const float* A, const dequantized_tensor_t* B,
+                                   float* C, int M, int N, int K);
+
+/* 
+ * Optimized kernel with prefetching for sequential access patterns
+ * Use this when A is accessed sequentially (e.g., batched inference)
+ */
+void matmul_dequantized_prefetch(const float* A, const dequantized_tensor_t* B,
+                                  float* C, int M, int N, int K);
+
 #ifdef __cplusplus
 }
 #endif

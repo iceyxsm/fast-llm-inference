@@ -1,6 +1,5 @@
 /*
- * Fused Operations Benchmark
- * Compares separate matmuls vs fused FFN kernel
+ * Fused Kernel Benchmark
  */
 
 #include <stdio.h>
@@ -22,12 +21,13 @@
 #include "dequantized_tensor.h"
 #include "cpu_features.h"
 
-/* Declare fused function */
-extern void fused_ffn(const float* input,
-                      const dequantized_tensor_t* gate_up,
-                      const dequantized_tensor_t* down,
-                      float* output,
-                      int hidden, int intermediate);
+extern void matmul_dequantized_asm_style(const float* A, const dequantized_tensor_t* B,
+                                          float* C, int M, int N, int K);
+extern void matmul_gate_up_swiglu_fused(const float* A,
+                                         const dequantized_tensor_t* B_gate,
+                                         const dequantized_tensor_t* B_up,
+                                         float* C,
+                                         int M, int N, int K);
 
 double get_time_ms() {
     LARGE_INTEGER freq, count;
@@ -36,46 +36,11 @@ double get_time_ms() {
     return (double)count.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
-/* Separate matmuls FFN */
-void ffn_separate(const float* input,
-                  const dequantized_tensor_t* gate,
-                  const dequantized_tensor_t* up,
-                  const dequantized_tensor_t* down,
-                  float* output,
-                  int hidden, int intermediate) {
-    
-    float* gate_out = aligned_malloc(intermediate * sizeof(float), 32);
-    float* up_out = aligned_malloc(intermediate * sizeof(float), 32);
-    float* down_out = aligned_malloc(hidden * sizeof(float), 32);
-    
-    /* Separate matmuls */
-    matmul_dequantized(input, gate, gate_out, 1, intermediate, hidden);
-    matmul_dequantized(input, up, up_out, 1, intermediate, hidden);
-    
-    /* Activation */
-    for (int i = 0; i < intermediate; i++) {
-        float sig = 1.0f / (1.0f + expf(-gate_out[i]));
-        gate_out[i] = gate_out[i] * sig * up_out[i];
-    }
-    
-    /* Down projection */
-    matmul_dequantized(gate_out, down, down_out, 1, hidden, intermediate);
-    
-    /* Residual */
-    for (int i = 0; i < hidden; i++) {
-        output[i] = input[i] + down_out[i];
-    }
-    
-    aligned_free(gate_out);
-    aligned_free(up_out);
-    aligned_free(down_out);
-}
-
 int main() {
     srand((unsigned)time(NULL));
     
     printf("\n========================================\n");
-    printf("  FUSED vs SEPARATE FFN BENCHMARK\n");
+    printf("  FUSED KERNEL BENCHMARK\n");
     printf("========================================\n\n");
     
     cpu_features_t cpu = detect_cpu_features();
@@ -84,112 +49,108 @@ int main() {
     int hidden = 3072;
     int intermediate = 8192;
     
-    /* Create test weights */
-    dequantized_tensor_t gate_up, gate_sep, up_sep, down;
+    /* Create weights - separate gate and up matrices */
+    dequantized_tensor_t W_gate, W_up, W_down;
     
-    /* Fused gate_up: [2*intermediate, hidden] */
-    gate_up.rows = 2 * intermediate;
-    gate_up.cols = hidden;
-    gate_up.weights = aligned_malloc(2 * intermediate * hidden, 64);
-    gate_up.scales = aligned_malloc(2 * intermediate * sizeof(float), 64);
+    /* Gate: [inter, hidden] = [8192, 3072] */
+    W_gate.rows = intermediate;
+    W_gate.cols = hidden;
+    W_gate.weights = aligned_malloc(intermediate * hidden, 64);
+    W_gate.scales = aligned_malloc(intermediate * sizeof(float), 64);
     
-    for (int r = 0; r < 2 * intermediate; r++) {
-        gate_up.scales[r] = 0.01f;
+    /* Up: [inter, hidden] = [8192, 3072] */
+    W_up.rows = intermediate;
+    W_up.cols = hidden;
+    W_up.weights = aligned_malloc(intermediate * hidden, 64);
+    W_up.scales = aligned_malloc(intermediate * sizeof(float), 64);
+    
+    /* Down: [hidden, intermediate] = [3072, 8192] */
+    W_down.rows = hidden;
+    W_down.cols = intermediate;
+    W_down.weights = aligned_malloc(hidden * intermediate, 64);
+    W_down.scales = aligned_malloc(hidden * sizeof(float), 64);
+    
+    for (int r = 0; r < intermediate; r++) {
+        W_gate.scales[r] = 0.01f;
+        W_up.scales[r] = 0.01f;
         for (int c = 0; c < hidden; c++) {
-            gate_up.weights[r * hidden + c] = (rand() % 256) - 128;
+            W_gate.weights[r * hidden + c] = (rand() % 256) - 128;
+            W_up.weights[r * hidden + c] = (rand() % 256) - 128;
         }
     }
-    
-    /* Separate gate and up */
-    gate_sep.rows = intermediate;
-    gate_sep.cols = hidden;
-    gate_sep.weights = aligned_malloc(intermediate * hidden, 64);
-    gate_sep.scales = aligned_malloc(intermediate * sizeof(float), 64);
-    memcpy(gate_sep.weights, gate_up.weights, intermediate * hidden);
-    memcpy(gate_sep.scales, gate_up.scales, intermediate * sizeof(float));
-    
-    up_sep.rows = intermediate;
-    up_sep.cols = hidden;
-    up_sep.weights = aligned_malloc(intermediate * hidden, 64);
-    up_sep.scales = aligned_malloc(intermediate * sizeof(float), 64);
-    memcpy(up_sep.weights, gate_up.weights + intermediate * hidden, intermediate * hidden);
-    memcpy(up_sep.scales, gate_up.scales + intermediate, intermediate * sizeof(float));
-    
-    /* Down projection */
-    down.rows = hidden;
-    down.cols = intermediate;
-    down.weights = aligned_malloc(hidden * intermediate, 64);
-    down.scales = aligned_malloc(hidden * sizeof(float), 64);
     
     for (int r = 0; r < hidden; r++) {
-        down.scales[r] = 0.01f;
+        W_down.scales[r] = 0.01f;
         for (int c = 0; c < intermediate; c++) {
-            down.weights[r * intermediate + c] = (rand() % 256) - 128;
+            W_down.weights[r * intermediate + c] = (rand() % 256) - 128;
         }
     }
     
-    /* Input/output */
-    float* input = aligned_malloc(hidden * sizeof(float), 32);
-    float* output_fused = aligned_malloc(hidden * sizeof(float), 32);
-    float* output_sep = aligned_malloc(hidden * sizeof(float), 32);
+    float* input = aligned_malloc(hidden * sizeof(float), 64);
+    float* gate_out = aligned_malloc(intermediate * sizeof(float), 64);
+    float* up_out = aligned_malloc(intermediate * sizeof(float), 64);
+    float* swiglu_out = aligned_malloc(intermediate * sizeof(float), 64);
+    float* final_out = aligned_malloc(hidden * sizeof(float), 64);
     
     for (int i = 0; i < hidden; i++) {
         input[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     }
     
-    /* Warmup */
-    printf("Warmup...\n");
-    for (int i = 0; i < 10; i++) {
-        fused_ffn(input, &gate_up, &down, output_fused, hidden, intermediate);
-        ffn_separate(input, &gate_sep, &up_sep, &down, output_sep, hidden, intermediate);
-    }
+    int iterations = 100;
     
-    /* Benchmark fused */
-    printf("\nBenchmarking fused FFN...\n");
+    /* Benchmark separate vs fused */
+    printf("Gate+Up+SwiGLU Benchmark:\n");
+    printf("(Intermediate = %d)\n\n", intermediate);
+    
+    /* Separate approach */
     double start = get_time_ms();
-    for (int i = 0; i < 1000; i++) {
-        fused_ffn(input, &gate_up, &down, output_fused, hidden, intermediate);
+    for (int i = 0; i < iterations; i++) {
+        matmul_dequantized_asm_style(input, &W_gate, gate_out, 1, intermediate, hidden);
+        matmul_dequantized_asm_style(input, &W_up, up_out, 1, intermediate, hidden);
+        /* SwiGLU */
+        for (int j = 0; j < intermediate; j++) {
+            float g = gate_out[j];
+            float u = up_out[j];
+            float sig = 1.0f / (1.0f + expf(-g));
+            swiglu_out[j] = g * sig * u;
+        }
     }
-    double fused_time = get_time_ms() - start;
+    double t_separate = (get_time_ms() - start) / iterations;
+    printf("Separate (2x matmul + SwiGLU): %.3f ms\n", t_separate);
     
-    /* Benchmark separate */
-    printf("Benchmarking separate matmuls...\n");
+    /* Fused approach */
     start = get_time_ms();
-    for (int i = 0; i < 1000; i++) {
-        ffn_separate(input, &gate_sep, &up_sep, &down, output_sep, hidden, intermediate);
+    for (int i = 0; i < iterations; i++) {
+        matmul_gate_up_swiglu_fused(input, &W_gate, &W_up, swiglu_out, 1, intermediate, hidden);
     }
-    double sep_time = get_time_ms() - start;
+    double t_fused = (get_time_ms() - start) / iterations;
+    printf("Fused (matmul+SwiGLU):         %.3f ms\n", t_fused);
     
-    /* Results */
-    printf("\n=== RESULTS ===\n");
-    printf("Fused:   %.3f ms (%.2f us per call)\n", fused_time, fused_time);
-    printf("Separate: %.3f ms (%.2f us per call)\n", sep_time, sep_time);
-    printf("Speedup: %.2fx\n", sep_time / fused_time);
+    printf("\nSpeedup: %.2fx\n", t_separate / t_fused);
     
-    /* Estimate full model */
-    double ms_per_layer_fused = fused_time;  /* Already per 1000 calls, so us per call */
-    double ms_per_layer_sep = sep_time;
+    /* Full model estimate */
+    start = get_time_ms();
+    for (int i = 0; i < 50; i++) {
+        matmul_dequantized_asm_style(swiglu_out, &W_down, final_out, 1, hidden, intermediate);
+    }
+    double t_down = (get_time_ms() - start) / 50.0;
+    printf("\nDown projection: %.3f ms\n", t_down);
     
-    double tok_per_sec_fused = 1000000.0 / (ms_per_layer_fused * 32 * 2);  /* 2 matmuls per layer, 32 layers */
-    double tok_per_sec_sep = 1000000.0 / (ms_per_layer_sep * 32 * 2);
+    double t_total_fused = t_fused + t_down;
+    double tok_sec = 1000.0 / t_total_fused / 32.0;
     
-    printf("\nEstimated 32-layer FFN-only speed:\n");
-    printf("  Fused:   %.2f tok/sec\n", tok_per_sec_fused);
-    printf("  Separate: %.2f tok/sec\n", tok_per_sec_sep);
-    printf("\n");
+    printf("\n=== ESTIMATED PERFORMANCE ===\n");
+    printf("Per layer: %.3f ms\n", t_total_fused);
+    printf("Tokens/sec: %.2f\n", tok_sec);
+    printf("Target: 50 tok/sec\n");
+    printf("Gap: %.1f%%\n", (tok_sec / 50.0) * 100.0);
     
     /* Cleanup */
-    aligned_free(gate_up.weights);
-    aligned_free(gate_up.scales);
-    aligned_free(gate_sep.weights);
-    aligned_free(gate_sep.scales);
-    aligned_free(up_sep.weights);
-    aligned_free(up_sep.scales);
-    aligned_free(down.weights);
-    aligned_free(down.scales);
-    aligned_free(input);
-    aligned_free(output_fused);
-    aligned_free(output_sep);
+    aligned_free(W_gate.weights); aligned_free(W_gate.scales);
+    aligned_free(W_up.weights); aligned_free(W_up.scales);
+    aligned_free(W_down.weights); aligned_free(W_down.scales);
+    aligned_free(input); aligned_free(gate_out); aligned_free(up_out);
+    aligned_free(swiglu_out); aligned_free(final_out);
     
     return 0;
 }

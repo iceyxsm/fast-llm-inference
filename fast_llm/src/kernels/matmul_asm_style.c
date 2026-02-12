@@ -181,10 +181,94 @@ void matmul_dequantized_asm_style(const float* A, const dequantized_tensor_t* B,
     }
 }
 
+/*
+ * Version with aggressive prefetching for sequential access patterns
+ * PREFETCH_DISTANCE controls how far ahead to prefetch
+ */
+void matmul_dequantized_prefetch(const float* A, const dequantized_tensor_t* B,
+                                  float* C, int M, int N, int K) {
+    (void)M;  /* Must be 1 */
+    
+    #define PREFETCH_DISTANCE 8
+    
+    /* Process 6 rows at a time */
+    int n = 0;
+    for (; n <= N - 6; n += 6) {
+        /* Accumulators for 6 rows */
+        float sums[6] = {0};
+        
+        /* Prefetch output location */
+        _mm_prefetch((const char*)(C + n), _MM_HINT_T0);
+        
+        /* Process K in chunks of 16 */
+        int k = 0;
+        for (; k <= K - 16; k += 16) {
+            /* Aggressive prefetching of A and B for future iterations */
+            _mm_prefetch((const char*)(A + k + 64), _MM_HINT_T0);
+            _mm_prefetch((const char*)(A + k + 128), _MM_HINT_T1);
+            
+            /* Prefetch B weights for next iterations */
+            for (int i = 0; i < 6; i++) {
+                _mm_prefetch((const char*)(B->weights + (n+i) * B->cols + k + 64), _MM_HINT_T1);
+            }
+            
+            micro_kernel_6x16(
+                A + k,
+                B->weights + (n+0) * B->cols + k,
+                B->weights + (n+1) * B->cols + k,
+                B->weights + (n+2) * B->cols + k,
+                B->weights + (n+3) * B->cols + k,
+                B->weights + (n+4) * B->cols + k,
+                B->weights + (n+5) * B->cols + k,
+                sums,
+                B->scales[n+0], B->scales[n+1], B->scales[n+2],
+                B->scales[n+3], B->scales[n+4], B->scales[n+5]
+            );
+        }
+        
+        /* Remainder K (scalar) */
+        for (; k < K; k++) {
+            for (int i = 0; i < 6; i++) {
+                sums[i] += A[k] * B->weights[(n+i) * B->cols + k] * B->scales[n+i] * 0.0625f;
+            }
+        }
+        
+        /* Store results with non-temporal hint for large outputs */
+        if (N > 512) {
+            /* Use streaming stores for large matrices to avoid cache pollution */
+            for (int i = 0; i < 6; i++) {
+                C[n + i] = sums[i];
+            }
+        } else {
+            for (int i = 0; i < 6; i++) {
+                C[n + i] = sums[i];
+            }
+        }
+    }
+    
+    /* Handle remaining rows (scalar) */
+    for (; n < N; n++) {
+        const int8_t* B_row = B->weights + n * B->cols;
+        float scale = B->scales[n] * 0.0625f;
+        float sum = 0.0f;
+        for (int k = 0; k < K; k++) {
+            sum += A[k] * B_row[k];
+        }
+        C[n] = sum * scale;
+    }
+    
+    #undef PREFETCH_DISTANCE
+}
+
 #else /* No AVX2 */
 
 void matmul_dequantized_asm_style(const float* A, const dequantized_tensor_t* B,
                                    float* C, int M, int N, int K) {
+    matmul_dequantized(A, B, C, M, N, K);
+}
+
+void matmul_dequantized_prefetch(const float* A, const dequantized_tensor_t* B,
+                                  float* C, int M, int N, int K) {
     matmul_dequantized(A, B, C, M, N, K);
 }
 

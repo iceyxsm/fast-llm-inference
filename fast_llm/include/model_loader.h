@@ -16,6 +16,9 @@
 extern "C" {
 #endif
 
+/* Global: max layers to use for inference (0 = all layers) */
+extern int g_max_layers;
+
 /* Model architecture configuration */
 typedef struct {
     /* Architecture */
