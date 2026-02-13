@@ -444,8 +444,8 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         proj_type_t proj_type;
         parse_tensor_name(tensors[i].name, &layer_idx, &proj_type);
         
-        /* Debug: print all tensor names */
-        if (i < 20) {
+        /* Debug: print first few tensor names */
+        if (i < 5) {
             printf("  Tensor %d: %s -> layer=%d proj=%d\n", 
                    (int)i, tensors[i].name, layer_idx, proj_type);
         }
@@ -496,8 +496,49 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             
             aligned_free(f32_data);
             
+            /* Handle fused QKV - split into Q, K, V */
+            if (strstr(tensors[i].name, "attn_qkv")) {
+                /* QKV fused: rows = 3 * hidden_size, split into 3 parts */
+                int hidden_size = config.hidden_size;
+                
+                /* Create Q tensor (first third) */
+                dequantized_tensor_t* dt_q = malloc(sizeof(dequantized_tensor_t));
+                dt_q->rows = hidden_size;
+                dt_q->cols = cols;
+                dt_q->weights = aligned_malloc(hidden_size * cols, 64);
+                dt_q->scales = aligned_malloc(hidden_size * sizeof(float), 64);
+                memcpy(dt_q->weights, dt->weights, hidden_size * cols);
+                memcpy(dt_q->scales, dt->scales, hidden_size * sizeof(float));
+                model->q_proj[layer_idx] = dt_q;
+                
+                /* Create K tensor (middle third) */
+                dequantized_tensor_t* dt_k = malloc(sizeof(dequantized_tensor_t));
+                dt_k->rows = hidden_size;
+                dt_k->cols = cols;
+                dt_k->weights = aligned_malloc(hidden_size * cols, 64);
+                dt_k->scales = aligned_malloc(hidden_size * sizeof(float), 64);
+                memcpy(dt_k->weights, dt->weights + hidden_size * cols, hidden_size * cols);
+                memcpy(dt_k->scales, dt->scales + hidden_size, hidden_size * sizeof(float));
+                model->k_proj[layer_idx] = dt_k;
+                
+                /* Create V tensor (last third) */
+                dequantized_tensor_t* dt_v = malloc(sizeof(dequantized_tensor_t));
+                dt_v->rows = hidden_size;
+                dt_v->cols = cols;
+                dt_v->weights = aligned_malloc(hidden_size * cols, 64);
+                dt_v->scales = aligned_malloc(hidden_size * sizeof(float), 64);
+                memcpy(dt_v->weights, dt->weights + 2 * hidden_size * cols, hidden_size * cols);
+                memcpy(dt_v->scales, dt->scales + 2 * hidden_size, hidden_size * sizeof(float));
+                model->v_proj[layer_idx] = dt_v;
+                
+                /* Free original fused tensor */
+                dequantized_tensor_free(dt);
+                
+                loaded_tensors += 3;
+                total_bytes += rows * cols;
+            }
             /* Store in appropriate slot */
-            if (layer_idx >= 0 && layer_idx < config.num_layers) {
+            else if (layer_idx >= 0 && layer_idx < config.num_layers) {
                 switch (proj_type) {
                     case PROJ_Q: model->q_proj[layer_idx] = dt; break;
                     case PROJ_K: model->k_proj[layer_idx] = dt; break;
