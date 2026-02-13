@@ -219,8 +219,8 @@ static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
         return;
     }
     
-    /* LM head */
-    if (strstr(name, "output") || strstr(name, "lm_head")) {
+    /* LM head - but not attention output */
+    if ((strstr(name, "output") && !strstr(name, "attn_")) || strstr(name, "lm_head")) {
         *proj = PROJ_LM_HEAD;
         return;
     }
