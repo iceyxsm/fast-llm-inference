@@ -53,9 +53,9 @@ model_selector: model_selector.c
 	$(CC) -O3 -Iinclude -o model_selector$(EXE) model_selector.c $(LDFLAGS)
 	@echo "Built: model_selector$(EXE)"
 
-chat: chat.c src/gguf_loader.c src/kernels/dequantized_tensor.c src/kernels/activations_avx2.c src/kernels/cpu_features.c
-	$(CC) -O3 -mavx2 -mfma -Iinclude -o chat$(EXE) chat.c src/gguf_loader.c src/kernels/dequantized_tensor.c src/kernels/activations_avx2.c src/kernels/cpu_features.c $(LDFLAGS)
-	@echo "Built: chat$(EXE)"
+chat: chat.c src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/activations_avx2.o
+	$(CC) -O3 -mavx2 -mfma -fopenmp -ffast-math -Iinclude -o chat$(EXE) chat.c src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/activations_avx2.o $(LDFLAGS)
+	@echo "Built: chat$(EXE) (with REAL inference)"
 
 # Quick benchmark
 bench_quick: bench_quick.c src/kernels/matmul_asm_style.o src/kernels/cpu_features.o src/kernels/dequantized_tensor.o src/kernels/activations_avx2.o
