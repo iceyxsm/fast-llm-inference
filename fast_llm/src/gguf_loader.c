@@ -231,25 +231,26 @@ static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
         return;
     }
     
-    /* Attention projections */
+    /* Extract layer number first if blk. present */
     if (strstr(name, "blk.")) {
-        /* Extract layer number */
         const char* p = strstr(name, "blk.");
         if (p) {
             *layer = atoi(p + 4);
         }
-        
+    }
+    
+    /* Attention projections */
+    if (strstr(name, "attn_") || strstr(name, "self_attn")) {
         if (strstr(name, "attn_q") || strstr(name, "q_proj")) *proj = PROJ_Q;
         else if (strstr(name, "attn_k") || strstr(name, "k_proj")) *proj = PROJ_K;
         else if (strstr(name, "attn_v") || strstr(name, "v_proj")) *proj = PROJ_V;
         else if (strstr(name, "attn_output") || strstr(name, "attn_o") || strstr(name, "o_proj")) *proj = PROJ_O;
+        /* Phi-3 fused QKV: map to Q for now (would need special handling) */
+        else if (strstr(name, "attn_qkv")) *proj = PROJ_Q;
     }
     
     /* FFN projections - handle both llama.cpp and HF naming */
-    if (strstr(name, "ffn_") || strstr(name, "mlp.")) {
-        const char* p = strstr(name, "blk.");
-        if (p) *layer = atoi(p + 4);
-        
+    if (strstr(name, "ffn_") || strstr(name, "mlp.") || strstr(name, "feed_forward")) {
         if (strstr(name, "ffn_gate") || strstr(name, "gate_proj")) *proj = PROJ_GATE;
         else if (strstr(name, "ffn_up") || strstr(name, "up_proj")) *proj = PROJ_UP;
         else if (strstr(name, "ffn_down") || strstr(name, "down_proj")) *proj = PROJ_DOWN;
