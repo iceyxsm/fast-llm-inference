@@ -239,20 +239,20 @@ static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
             *layer = atoi(p + 4);
         }
         
-        if (strstr(name, "attn_q")) *proj = PROJ_Q;
-        else if (strstr(name, "attn_k")) *proj = PROJ_K;
-        else if (strstr(name, "attn_v")) *proj = PROJ_V;
-        else if (strstr(name, "attn_output") || strstr(name, "attn_o")) *proj = PROJ_O;
+        if (strstr(name, "attn_q") || strstr(name, "q_proj")) *proj = PROJ_Q;
+        else if (strstr(name, "attn_k") || strstr(name, "k_proj")) *proj = PROJ_K;
+        else if (strstr(name, "attn_v") || strstr(name, "v_proj")) *proj = PROJ_V;
+        else if (strstr(name, "attn_output") || strstr(name, "attn_o") || strstr(name, "o_proj")) *proj = PROJ_O;
     }
     
-    /* FFN projections */
-    if (strstr(name, "ffn_")) {
+    /* FFN projections - handle both llama.cpp and HF naming */
+    if (strstr(name, "ffn_") || strstr(name, "mlp.")) {
         const char* p = strstr(name, "blk.");
         if (p) *layer = atoi(p + 4);
         
-        if (strstr(name, "ffn_gate")) *proj = PROJ_GATE;
-        else if (strstr(name, "ffn_up")) *proj = PROJ_UP;
-        else if (strstr(name, "ffn_down")) *proj = PROJ_DOWN;
+        if (strstr(name, "ffn_gate") || strstr(name, "gate_proj")) *proj = PROJ_GATE;
+        else if (strstr(name, "ffn_up") || strstr(name, "up_proj")) *proj = PROJ_UP;
+        else if (strstr(name, "ffn_down") || strstr(name, "down_proj")) *proj = PROJ_DOWN;
     }
     
     /* Alternative naming */
@@ -442,6 +442,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         int layer_idx;
         proj_type_t proj_type;
         parse_tensor_name(tensors[i].name, &layer_idx, &proj_type);
+        
+        /* Debug: print all tensor names */
+        if (i < 20) {
+            printf("  Tensor %d: %s -> layer=%d proj=%d\n", 
+                   (int)i, tensors[i].name, layer_idx, proj_type);
+        }
         
         /* Get dimensions */
         int rows = (tensors[i].n_dims > 0) ? tensors[i].dims[0] : 1;
