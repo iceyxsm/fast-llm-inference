@@ -419,6 +419,7 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     /* Track loading stats */
     int loaded_tensors = 0;
     int skipped_tensors = 0;
+    int unmapped_tensors = 0;
     size_t total_bytes = 0;
     
     /* Read and process each tensor */
@@ -525,6 +526,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 dequantized_tensor_free(dt);
             } else {
                 skipped_tensors++;
+                /* Debug: print first few unmapped tensors */
+                if (unmapped_tensors < 10) {
+                    printf("  [Unmapped: %s type=%d layer=%d proj=%d]\n", 
+                           tensors[i].name, tensors[i].type, layer_idx, proj_type);
+                    unmapped_tensors++;
+                }
                 dequantized_tensor_free(dt);
             }
         } else if (tensors[i].type == GGML_TYPE_F32) {
