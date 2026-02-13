@@ -40,7 +40,8 @@ SRCS = src/main.c \
        src/kernels/matmul_q4_k_avx2.c \
        src/kernels/matmul_prefetch_optimized.c \
        src/kernels/matmul_int8_vnni.c \
-       src/kernels/fused_swiglu_rms.c
+       src/kernels/fused_swiglu_rms.c \
+       src/kernels/activations_avx2.c
 
 # Add AVX-512 kernels if supported
 ifeq ($(HAVE_AVX512),1)

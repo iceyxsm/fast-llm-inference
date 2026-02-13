@@ -44,6 +44,11 @@ static inline float gelu(float x) {
     return 0.5f * x * (1.0f + tanhf(GELU_SCALING * (x + 0.044715f * x * x * x)));
 }
 
+/* AVX2-optimized activations */
+extern void silu_avx2(const float* input, float* output, int n);
+extern void swiglu_avx2(const float* gate, const float* up, float* output, int n);
+extern void rms_norm_avx2(const float* input, float* output, int n, float eps);
+
 /* Silu activation: x * sigmoid(x) */
 static inline float silu(float x) {
     return x / (1.0f + expf(-x));
@@ -51,6 +56,9 @@ static inline float silu(float x) {
 
 /* RMS norm: x / sqrt(mean(x^2) + eps) */
 static void rms_norm(const float* x, float* out, int n, float eps) {
+    #ifdef __AVX2__
+    rms_norm_avx2(x, out, n, eps);
+    #else
     float sum_sq = 0.0f;
     for (int i = 0; i < n; i++) {
         sum_sq += x[i] * x[i];
@@ -59,6 +67,7 @@ static void rms_norm(const float* x, float* out, int n, float eps) {
     for (int i = 0; i < n; i++) {
         out[i] = x[i] * scale;
     }
+    #endif
 }
 
 /* Softmax: exp(x_i - max) / sum(exp(x_j - max)) */
@@ -315,10 +324,7 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
         if (model->gate_proj[layer_idx]) {
             #if USE_OPTIMIZED_MATMUL
             matmul_dequantized_asm_style(ff_row, model->gate_proj[layer_idx], gate_row, 1, intermediate_size, hidden_size);
-            /* Apply SiLU activation */
-            for (int i = 0; i < intermediate_size; i++) {
-                gate_row[i] = silu(gate_row[i]);
-            }
+            /* SiLU will be applied in fused SwiGLU below */
             #else
             for (int i = 0; i < intermediate_size; i++) {
                 float sum = 0.0f;
@@ -349,10 +355,14 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
             #endif
         }
         
-        /* Element-wise multiply (SwiGLU) */
+        /* SwiGLU: fused SiLU(gate) * up using AVX2 */
+        #ifdef __AVX2__
+        swiglu_avx2(gate_row, up_row, gate_row, intermediate_size);
+        #else
         for (int i = 0; i < intermediate_size; i++) {
-            gate_row[i] *= up_row[i];
+            gate_row[i] = silu(gate_row[i]) * up_row[i];
         }
+        #endif
     }
     
     /* Down projection using optimized kernel */
