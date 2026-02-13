@@ -381,9 +381,9 @@ int generate(transformer_model_t* model, int* prompt_tokens, int num_prompt,
 /* Print banner */
 void print_banner(void) {
     printf("\n");
-    printf("╔════════════════════════════════════════════════════════╗\n");
-    printf("║         FAST LLM - INTERACTIVE CHAT                    ║\n");
-    printf("╚════════════════════════════════════════════════════════╝\n");
+    printf("========================================\n");
+    printf("       FAST LLM - INTERACTIVE CHAT     \n");
+    printf("========================================\n");
     printf("\n");
     printf("Commands:\n");
     printf("  /help    - Show this help\n");
