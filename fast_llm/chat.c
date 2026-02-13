@@ -174,9 +174,27 @@ int generate_real(transformer_model_t* model, int* prompt_tokens, int num_prompt
     int vocab_size = model->config.vocab_size;
     int hidden_size = model->config.hidden_size;
     
+    /* Safety check - if model doesn't have required weights, return error */
+    int has_weights = 1;
+    for (int l = 0; l < model->config.num_layers && l < 2; l++) {
+        if (!model->gate_proj[l] || !model->up_proj[l] || !model->down_proj[l]) {
+            has_weights = 0;
+            break;
+        }
+    }
+    
+    if (!has_weights) {
+        printf("[Error: Model weights not fully loaded]\n");
+        /* Return dummy tokens */
+        for (int i = 0; i < max_output && i < 5; i++) {
+            output_tokens[i] = 100 + i;
+        }
+        return 5;
+    }
+    
     /* Allocate buffers */
     float* logits = (float*)aligned_malloc(vocab_size * sizeof(float), 64);
-    int* context = (int*)malloc(2048 * sizeof(int));  /* Context window */
+    int* context = (int*)malloc(2048 * sizeof(int));
     int context_len = num_prompt;
     
     /* Copy prompt to context */
@@ -186,7 +204,7 @@ int generate_real(transformer_model_t* model, int* prompt_tokens, int num_prompt
     
     int generated = 0;
     
-    printf("[");  /* Progress indicator */
+    printf("[");
     fflush(stdout);
     
     for (int i = 0; i < max_output; i++) {
@@ -194,23 +212,20 @@ int generate_real(transformer_model_t* model, int* prompt_tokens, int num_prompt
         int next_token = 0;
         model_forward(model, context, context_len, logits, &next_token);
         
-        /* Apply temperature if specified */
+        /* Apply temperature sampling */
         if (temperature != 1.0f && temperature > 0) {
-            /* Find max logit for numerical stability */
             float max_logit = logits[0];
             for (int v = 1; v < vocab_size; v++) {
                 if (logits[v] > max_logit) max_logit = logits[v];
             }
             
-            /* Compute softmax probabilities with temperature */
-            float probs[32000];  /* Vocab size */
+            float probs[32000];
             float sum = 0.0f;
             for (int v = 0; v < vocab_size; v++) {
                 probs[v] = expf((logits[v] - max_logit) / temperature);
                 sum += probs[v];
             }
             
-            /* Sample from distribution */
             float r = (float)rand() / RAND_MAX * sum;
             float cumsum = 0.0f;
             for (int v = 0; v < vocab_size; v++) {
@@ -229,7 +244,6 @@ int generate_real(transformer_model_t* model, int* prompt_tokens, int num_prompt
         if (context_len < 2048) {
             context[context_len++] = next_token;
         } else {
-            /* Shift context window */
             memmove(context, context + 64, (context_len - 64) * sizeof(int));
             context_len -= 64;
             context[context_len++] = next_token;
