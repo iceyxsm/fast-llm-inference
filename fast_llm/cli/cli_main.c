@@ -74,10 +74,10 @@ static void run_model_flow(const char* explicit_model) {
         return;
     }
 
-    char model_path[512] = {0};
+    char model_path[1024] = {0};
 
     if (explicit_model && explicit_model[0]) {
-        strncpy(model_path, explicit_model, sizeof(model_path) - 1);
+        snprintf(model_path, sizeof(model_path), "%s", explicit_model);
     } else {
         /* List local models and let user pick */
         char locals[16][512];
@@ -91,7 +91,7 @@ static void run_model_flow(const char* explicit_model) {
         }
 
         if (nlocal == 1) {
-            strncpy(model_path, locals[0], sizeof(model_path) - 1);
+            snprintf(model_path, sizeof(model_path), "%s", locals[0]);
         } else {
             printf("\n  Local models:\n\n");
             for (int i = 0; i < nlocal; i++) {
@@ -107,7 +107,7 @@ static void run_model_flow(const char* explicit_model) {
             printf("\n  Select model (0 = back): ");
             int choice = cli_prompt_choice(nlocal);
             if (choice <= 0) return;
-            strncpy(model_path, locals[choice - 1], sizeof(model_path) - 1);
+            snprintf(model_path, sizeof(model_path), "%s", locals[choice - 1]);
         }
     }
 
@@ -173,9 +173,7 @@ static void status_flow(void) {
 static void parse_model_filename(const char* fname, char* name, int nsz,
                                   char* params, int psz, char* quant, int qsz) {
     char tmp[256];
-    strncpy(tmp, fname, sizeof(tmp)-1); tmp[sizeof(tmp)-1]='\0';
-
-    /* Remove .gguf extension */
+    snprintf(tmp, sizeof(tmp), "%s", fname);
     char* ext = strstr(tmp, ".gguf");
     if (ext) *ext = '\0';
 
@@ -230,7 +228,7 @@ static void parse_model_filename(const char* fname, char* name, int nsz,
     int len = (int)strlen(p);
     while (len>0 && p[len-1]==' ') p[--len]='\0';
 
-    strncpy(name, p, nsz-1); name[nsz-1]='\0';
+    snprintf(name, nsz, "%s", p);
 }
 
 /* ── My Models: show downloaded models with info ──────────────────── */
@@ -283,7 +281,7 @@ static void my_models_flow(void) {
 
             /* Truncate filename for display */
             char fn_disp[29];
-            strncpy(fn_disp, fname, 28); fn_disp[28]='\0';
+            snprintf(fn_disp, sizeof(fn_disp), "%s", fname);
 
             cli_color(CLR_GREEN);
             printf("  [%2d] ", i+1);
@@ -418,7 +416,7 @@ static void custom_url_flow(void) {
         if (!cli_prompt_yn("Continue anyway?")) return;
     }
 
-    char mdir[512], dest[512];
+    char mdir[1024], dest[1024];
     cli_get_models_dir(mdir, sizeof(mdir));
     cli_ensure_dirs();
     snprintf(dest, sizeof(dest), "%s%c%s", mdir, PATH_SEP, fname);
@@ -443,7 +441,7 @@ static void custom_url_flow(void) {
 
     /* Try to extract info from filename */
     char tmp_name[128];
-    strncpy(tmp_name, fname, sizeof(tmp_name)-1); tmp_name[sizeof(tmp_name)-1]='\0';
+    snprintf(tmp_name, sizeof(tmp_name), "%s", fname);
 
     /* Guess params from filename */
     double params = 0;
@@ -464,7 +462,7 @@ static void custom_url_flow(void) {
     char quant[16] = {0};
     const char* qpats[] = {"Q4_K_M","Q4_K_S","Q4_0","Q5_K_M","Q3_K_M","Q6_K","Q8_0","f16",NULL};
     for (int i=0;qpats[i];i++) {
-        if (strstr(fname, qpats[i])) { strncpy(quant, qpats[i], sizeof(quant)-1); break; }
+        if (strstr(fname, qpats[i])) { snprintf(quant, sizeof(quant), "%s", qpats[i]); break; }
     }
     if (quant[0]) {
         printf("  Quant:   %s\n", quant); fflush(stdout); cli_delay(60);
@@ -620,7 +618,13 @@ static void browse_flow(hw_specs_t* specs) {
 int main(int argc, char* argv[]) {
     srand((unsigned)time(NULL));
 
-    char model_path[512] = {0};
+    /* Enable UTF-8 output on Windows */
+#ifdef _WIN32
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+#endif
+
+    char model_path[1024] = {0};
     int do_off = 0, do_status = 0, is_daemon = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -629,7 +633,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--status") == 0)
             do_status = 1;
         else if (strcmp(argv[i], "--model") == 0 && i+1 < argc)
-            strncpy(model_path, argv[++i], sizeof(model_path)-1);
+            snprintf(model_path, sizeof(model_path), "%s", argv[++i]);
         else if (strcmp(argv[i], "--_daemon") == 0)
             is_daemon = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {

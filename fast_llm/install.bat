@@ -24,7 +24,7 @@ echo   Compiler: gcc
 echo   OS: Windows
 echo.
 
-set CFLAGS=-O3 -Wall -fPIC -fopenmp -ffast-math -mavx2 -mfma -Iinclude
+set CFLAGS=-O3 -Wall -Wextra -fPIC -fopenmp -ffast-math -mavx2 -mfma -Iinclude
 set LDFLAGS=-lws2_32 -lm -lpsapi -fopenmp
 
 echo   Compiling kernels...

@@ -37,7 +37,7 @@ static long get_file_size(const char* path) {
 /* ── Download a catalog model — shows speed + final size ──────────── */
 
 int download_model(const model_entry_t* m) {
-    char mdir[512], dest[512], size_str[32];
+    char mdir[1024], dest[1024], size_str[32];
     cli_get_models_dir(mdir, sizeof(mdir));
     cli_ensure_dirs();
     snprintf(dest, sizeof(dest), "%s%c%s", mdir, PATH_SEP, m->filename);
@@ -94,12 +94,12 @@ int download_model(const model_entry_t* m) {
 /* ── Find any local .gguf model ───────────────────────────────────── */
 
 int find_local_model(char* out, int sz) {
-    char mdir[512];
+    char mdir[1024];
     cli_get_models_dir(mdir, sizeof(mdir));
 
 #ifdef _WIN32
     WIN32_FIND_DATAA fd;
-    char pat[512];
+    char pat[1024];
     snprintf(pat, sizeof(pat), "%s\\*.gguf", mdir);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -108,7 +108,7 @@ int find_local_model(char* out, int sz) {
         return 1;
     }
 #else
-    char cmd[512];
+    char cmd[1024];
     snprintf(cmd, sizeof(cmd), "ls '%s'/*.gguf 2>/dev/null | head -1", mdir);
     FILE* fp = popen(cmd, "r");
     if (fp) {
@@ -126,13 +126,13 @@ int find_local_model(char* out, int sz) {
 /* ── List all local .gguf models ──────────────────────────────────── */
 
 int list_local_models(char out[][512], int max) {
-    char mdir[512];
+    char mdir[1024];
     cli_get_models_dir(mdir, sizeof(mdir));
     int count = 0;
 
 #ifdef _WIN32
     WIN32_FIND_DATAA fd;
-    char pat[512];
+    char pat[1024];
     snprintf(pat, sizeof(pat), "%s\\*.gguf", mdir);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -144,7 +144,7 @@ int list_local_models(char out[][512], int max) {
         FindClose(h);
     }
 #else
-    char cmd[512];
+    char cmd[1024];
     snprintf(cmd, sizeof(cmd), "ls '%s'/*.gguf 2>/dev/null", mdir);
     FILE* fp = popen(cmd, "r");
     if (fp) {
@@ -152,7 +152,7 @@ int list_local_models(char out[][512], int max) {
         while (fgets(line, sizeof(line), fp) && count < max) {
             line[strcspn(line, "\n")] = '\0';
             if (strlen(line) > 0) {
-                strncpy(out[count], line, 511);
+                snprintf(out[count], 512, "%s", line);
                 count++;
             }
         }

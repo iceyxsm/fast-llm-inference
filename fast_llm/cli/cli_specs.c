@@ -57,7 +57,7 @@ static void detect_cpu_name(char* buf, int sz) {
         __cpuid((int*)(brand + 32), 0x80000004);
         char* p = brand;
         while (*p == ' ') p++;
-        strncpy(buf, p, sz - 1);
+        snprintf(buf, sz, "%s", p);
     }
 #elif defined(__APPLE__)
     FILE* fp = popen("sysctl -n machdep.cpu.brand_string 2>/dev/null", "r");
@@ -69,14 +69,14 @@ static void detect_cpu_name(char* buf, int sz) {
         while (fgets(line, sizeof(line), fp)) {
             if (strncmp(line, "model name", 10) == 0) {
                 char* p = strchr(line, ':');
-                if (p) { p++; while (*p == ' ') p++; strncpy(buf, p, sz - 1); buf[strcspn(buf, "\n")] = '\0'; }
+                if (p) { p++; while (*p == ' ') p++; snprintf(buf, sz, "%s", p); buf[strcspn(buf, "\n")] = '\0'; }
                 break;
             }
         }
         fclose(fp);
     }
 #endif
-    if (buf[0] == '\0') strncpy(buf, "Unknown CPU", sz - 1);
+    if (buf[0] == '\0') snprintf(buf, sz, "%s", "Unknown CPU");
 }
 
 /* ── Helper: trim string in place ─────────────────────────────────── */
@@ -120,9 +120,9 @@ static void detect_gpus(hw_specs_t* s) {
                 g = &s->gpus[s->gpu_count++];
                 memset(g, 0, sizeof(*g));
                 g->has_metal = 1;
-                char* p = strchr(line, ':'); if (p) { p++; while (*p == ' ') p++; strncpy(g->name, p, sizeof(g->name)-1); trim(g->name); }
+                char* p = strchr(line, ':'); if (p) { p++; while (*p == ' ') p++; snprintf(g->name, sizeof(g->name), "%s", p); trim(g->name); }
                 g->is_discrete = !is_integrated_gpu(g->name);
-                strncpy(g->driver, "Metal", sizeof(g->driver)-1);
+                snprintf(g->driver, sizeof(g->driver), "%s", "Metal");
             }
             if (g && strstr(line, "VRAM")) {
                 char* p = strchr(line, ':');
@@ -139,7 +139,7 @@ static void detect_gpus(hw_specs_t* s) {
         g->vram_gb = s->ram_gb;
         g->has_metal = 1;
         g->is_discrete = 0;
-        strncpy(g->driver, "Metal", sizeof(g->driver)-1);
+        snprintf(g->driver, sizeof(g->driver), "%s", "Metal");
     }
 
 #elif defined(_WIN32)
@@ -164,20 +164,20 @@ static void detect_gpus(hw_specs_t* s) {
 
             char* c2 = strchr(p, ','); if (!c2) continue; *c2 = '\0';
             char driver[64] = {0};
-            strncpy(driver, p, sizeof(driver)-1); trim(driver);
+            snprintf(driver, sizeof(driver), "%s", p); trim(driver);
             p = c2 + 1;
 
             char name[128] = {0};
-            strncpy(name, p, sizeof(name)-1); trim(name);
+            snprintf(name, sizeof(name), "%s", p); trim(name);
 
             if (strlen(name) < 3) continue;
             if (strstr(name, "Microsoft Basic")) continue;
 
             gpu_info_t* g = &s->gpus[s->gpu_count++];
             memset(g, 0, sizeof(*g));
-            strncpy(g->name, name, sizeof(g->name)-1);
+            snprintf(g->name, sizeof(g->name), "%s", name);
             g->vram_gb = vram_bytes / (1024.0 * 1024.0 * 1024.0);
-            strncpy(g->driver, driver, sizeof(g->driver)-1);
+            snprintf(g->driver, sizeof(g->driver), "%s", driver);
             g->is_discrete = !is_integrated_gpu(name);
         }
         _pclose(fp);
@@ -196,12 +196,12 @@ static void detect_gpus(hw_specs_t* s) {
             char* c1 = strchr(line, ',');
             if (c1) {
                 *c1 = '\0';
-                strncpy(nv_name, line, sizeof(nv_name)-1); trim(nv_name);
+                snprintf(nv_name, sizeof(nv_name), "%s", line); trim(nv_name);
                 char* c2 = strchr(c1+1, ',');
                 if (c2) {
                     *c2 = '\0';
                     nv_vram = atof(c1+1) / 1024.0; /* MiB to GB */
-                    strncpy(nv_driver, c2+1, sizeof(nv_driver)-1); trim(nv_driver);
+                    snprintf(nv_driver, sizeof(nv_driver), "%s", c2+1); trim(nv_driver);
                 } else {
                     nv_vram = atof(c1+1) / 1024.0;
                 }
@@ -214,7 +214,7 @@ static void detect_gpus(hw_specs_t* s) {
                     s->gpus[i].vram_gb = nv_vram;
                     s->gpus[i].has_cuda = 1;
                     s->gpus[i].is_discrete = 1;
-                    if (nv_driver[0]) strncpy(s->gpus[i].driver, nv_driver, sizeof(s->gpus[i].driver)-1);
+                    if (nv_driver[0]) snprintf(s->gpus[i].driver, sizeof(s->gpus[i].driver), "%s", nv_driver);
                     found = 1;
                     break;
                 }
@@ -222,9 +222,9 @@ static void detect_gpus(hw_specs_t* s) {
             if (!found && s->gpu_count < MAX_GPUS) {
                 gpu_info_t* g = &s->gpus[s->gpu_count++];
                 memset(g, 0, sizeof(*g));
-                strncpy(g->name, nv_name, sizeof(g->name)-1);
+                snprintf(g->name, sizeof(g->name), "%s", nv_name);
                 g->vram_gb = nv_vram;
-                strncpy(g->driver, nv_driver, sizeof(g->driver)-1);
+                snprintf(g->driver, sizeof(g->driver), "%s", nv_driver);
                 g->has_cuda = 1;
                 g->is_discrete = 1;
             }
@@ -245,7 +245,7 @@ static void detect_gpus(hw_specs_t* s) {
 
             gpu_info_t* g = &s->gpus[s->gpu_count++];
             memset(g, 0, sizeof(*g));
-            strncpy(g->name, colon, sizeof(g->name)-1); trim(g->name);
+            snprintf(g->name, sizeof(g->name), "%s", colon); trim(g->name);
             g->is_discrete = !is_integrated_gpu(g->name);
         }
         pclose(fp);
@@ -261,9 +261,9 @@ static void detect_gpus(hw_specs_t* s) {
             char nv_name[128]={0}; double nv_vram=0; char nv_drv[64]={0};
             char* c1 = strchr(line, ',');
             if (c1) {
-                *c1='\0'; strncpy(nv_name, line, 127); trim(nv_name);
+                *c1='\0'; snprintf(nv_name, sizeof(nv_name), "%s", line); trim(nv_name);
                 char* c2 = strchr(c1+1, ',');
-                if (c2) { *c2='\0'; nv_vram=atof(c1+1)/1024.0; strncpy(nv_drv,c2+1,63); trim(nv_drv); }
+                if (c2) { *c2='\0'; nv_vram=atof(c1+1)/1024.0; snprintf(nv_drv, sizeof(nv_drv), "%s", c2+1); trim(nv_drv); }
                 else nv_vram=atof(c1+1)/1024.0;
             }
             /* Match to lspci entry */
@@ -272,7 +272,7 @@ static void detect_gpus(hw_specs_t* s) {
                     s->gpus[i].vram_gb = nv_vram;
                     s->gpus[i].has_cuda = 1;
                     s->gpus[i].is_discrete = 1;
-                    if (nv_drv[0]) strncpy(s->gpus[i].driver, nv_drv, sizeof(s->gpus[i].driver)-1);
+                    if (nv_drv[0]) snprintf(s->gpus[i].driver, sizeof(s->gpus[i].driver), "%s", nv_drv);
                     break;
                 }
             }
@@ -300,7 +300,7 @@ static void detect_gpus(hw_specs_t* s) {
     if (s->gpu_count == 0) {
         gpu_info_t* g = &s->gpus[0];
         memset(g, 0, sizeof(*g));
-        strncpy(g->name, "None detected", sizeof(g->name)-1);
+        snprintf(g->name, sizeof(g->name), "%s", "None detected");
         s->gpu_count = 1;
     }
 }
@@ -380,7 +380,7 @@ void specs_rate(hw_specs_t* s) {
 /* ── Save / Load ──────────────────────────────────────────────────── */
 
 void specs_save(const hw_specs_t* s) {
-    char path[512];
+    char path[1024];
     cli_get_specs_path(path, sizeof(path));
     cli_ensure_dirs();
     FILE* f = fopen(path, "wb");
@@ -388,7 +388,7 @@ void specs_save(const hw_specs_t* s) {
 }
 
 int specs_load(hw_specs_t* s) {
-    char path[512];
+    char path[1024];
     cli_get_specs_path(path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f) return 0;

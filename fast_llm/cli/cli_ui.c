@@ -13,37 +13,37 @@ void cli_get_fllm_dir(char* buf, int sz) {
 }
 
 void cli_get_models_dir(char* buf, int sz) {
-    char dir[512];
+    char dir[1024];
     cli_get_fllm_dir(dir, sizeof(dir));
     snprintf(buf, sz, "%s%c%s", dir, PATH_SEP, MODELS_DIR_NAME);
 }
 
 void cli_get_pid_path(char* buf, int sz) {
-    char dir[512];
+    char dir[1024];
     cli_get_fllm_dir(dir, sizeof(dir));
     snprintf(buf, sz, "%s%c%s", dir, PATH_SEP, PID_FILE_NAME);
 }
 
 void cli_get_specs_path(char* buf, int sz) {
-    char dir[512];
+    char dir[1024];
     cli_get_fllm_dir(dir, sizeof(dir));
     snprintf(buf, sz, "%s%c%s", dir, PATH_SEP, SPECS_FILE_NAME);
 }
 
 void cli_get_log_path(char* buf, int sz) {
-    char dir[512];
+    char dir[1024];
     cli_get_fllm_dir(dir, sizeof(dir));
     snprintf(buf, sz, "%s%c%s", dir, PATH_SEP, LOG_FILE_NAME);
 }
 
 void cli_get_catalog_path(char* buf, int sz) {
-    char dir[512];
+    char dir[1024];
     cli_get_fllm_dir(dir, sizeof(dir));
     snprintf(buf, sz, "%s%c%s", dir, PATH_SEP, CATALOG_CACHE);
 }
 
 void cli_ensure_dirs(void) {
-    char d[512];
+    char d[1024];
     cli_get_fllm_dir(d, sizeof(d));   MKDIR_P(d);
     cli_get_models_dir(d, sizeof(d));  MKDIR_P(d);
 }

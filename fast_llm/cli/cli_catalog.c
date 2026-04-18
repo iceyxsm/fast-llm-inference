@@ -27,7 +27,7 @@ static void trim(char* s) {
 }
 
 static char* fetch_json(const char* url, int max_bytes) {
-    char tmp[512];
+    char tmp[1024];
     cli_get_fllm_dir(tmp, sizeof(tmp));
     strncat(tmp, PATH_SEP_S "_tmp.json", sizeof(tmp)-strlen(tmp)-1);
     char cmd[2048];
@@ -102,24 +102,24 @@ static int guess_context(const char* n) {
 
 static void extract_quant(const char* fn, char* out, int sz) {
     const char* p[] = {"Q4_K_M","Q4_K_S","Q4_0","Q5_K_M","Q5_K_S","Q3_K_M","Q6_K","Q8_0","f16",NULL};
-    for (int i=0;p[i];i++) if (strstr(fn,p[i])) { strncpy(out,p[i],sz-1); return; }
-    strncpy(out,"Q4",sz-1);
+    for (int i=0;p[i];i++) if (strstr(fn,p[i])) { snprintf(out,sz,"%s",p[i]); return; }
+    snprintf(out,sz,"%s","Q4");
 }
 
 static void extract_family(const char* n, char* out, int sz) {
-    if (strstr(n,"Llama")||strstr(n,"TinyLlama")) strncpy(out,"Llama",sz-1);
-    else if (strstr(n,"Mistral")||strstr(n,"Mixtral")) strncpy(out,"Mistral",sz-1);
-    else if (strstr(n,"Qwen")) strncpy(out,"Qwen",sz-1);
-    else if (strstr(n,"Phi")) strncpy(out,"Phi",sz-1);
-    else if (strstr(n,"Gemma")) strncpy(out,"Gemma",sz-1);
-    else if (strstr(n,"DeepSeek")) strncpy(out,"DeepSeek",sz-1);
-    else if (strstr(n,"Whisper")) strncpy(out,"Whisper",sz-1);
-    else strncpy(out,"Other",sz-1);
+    if (strstr(n,"Llama")||strstr(n,"TinyLlama")) snprintf(out,sz,"%s","Llama");
+    else if (strstr(n,"Mistral")||strstr(n,"Mixtral")) snprintf(out,sz,"%s","Mistral");
+    else if (strstr(n,"Qwen")) snprintf(out,sz,"%s","Qwen");
+    else if (strstr(n,"Phi")) snprintf(out,sz,"%s","Phi");
+    else if (strstr(n,"Gemma")) snprintf(out,sz,"%s","Gemma");
+    else if (strstr(n,"DeepSeek")) snprintf(out,sz,"%s","DeepSeek");
+    else if (strstr(n,"Whisper")) snprintf(out,sz,"%s","Whisper");
+    else snprintf(out,sz,"%s","Other");
 }
 
 static void make_short_name(const char* full, char* out, int sz) {
     char tmp[128];
-    strncpy(tmp, full, sizeof(tmp)-1); tmp[sizeof(tmp)-1]='\0';
+    snprintf(tmp, sizeof(tmp), "%s", full);
 
     /* Remove common suffixes */
     char* suf[] = {"-GGUF","_GGUF","-Instruct","-instruct","-Chat","-chat","-it",
@@ -184,7 +184,7 @@ static void make_short_name(const char* full, char* out, int sz) {
     }
     cleaned[cpos] = '\0';
     trim(cleaned);
-    strncpy(out, cleaned, sz-1); out[sz-1]='\0';
+    snprintf(out, sz, "%s", cleaned);
 }
 
 static hw_tier_t tier_from_params(double p) {
@@ -286,7 +286,7 @@ static int parse_repo(const char* repo_id, model_entry_t* e) {
         long fsz=0;
         if (sz_p) { sz_p=strchr(sz_p,':'); if(sz_p) fsz=(long)atof(sz_p+1); }
 
-        if (p > best_prio) { strncpy(best_file,fn,255); best_size=fsz; best_prio=p; }
+        if (p > best_prio) { snprintf(best_file,sizeof(best_file),"%s",fn); best_size=fsz; best_prio=p; }
         cur++;
     }
     if (best_file[0]=='\0') { free(json); return 0; }
@@ -298,16 +298,16 @@ static int parse_repo(const char* repo_id, model_entry_t* e) {
 
     free(json);
 
-    strncpy(e->id, repo_id, sizeof(e->id)-1);
-    strncpy(e->filename, best_file, sizeof(e->filename)-1);
+    snprintf(e->id, sizeof(e->id), "%s", repo_id);
+    snprintf(e->filename, sizeof(e->filename), "%s", best_file);
     snprintf(e->url, sizeof(e->url), "https://huggingface.co/%s/resolve/main/%s", repo_id, best_file);
 
     char clean[128];
-    strncpy(clean, repo_id, sizeof(clean)-1);
+    snprintf(clean, sizeof(clean), "%s", repo_id);
     char* sl=strchr(clean,'/'); if(sl) memmove(clean,sl+1,strlen(sl));
     char* gf=strstr(clean,"-GGUF"); if(gf)*gf='\0';
     gf=strstr(clean,"_GGUF"); if(gf)*gf='\0';
-    strncpy(e->full_name, clean, sizeof(e->full_name)-1);
+    snprintf(e->full_name, sizeof(e->full_name), "%s", clean);
 
     make_short_name(clean, e->short_name, sizeof(e->short_name));
     extract_family(clean, e->family, sizeof(e->family));
@@ -399,7 +399,7 @@ int catalog_fetch(model_entry_t* out, int max, model_type_t type) {
 /* ── Cache ────────────────────────────────────────────────────────── */
 
 void catalog_save_cache(const model_entry_t* entries, int count) {
-    char path[512];
+    char path[1024];
     cli_get_catalog_path(path, sizeof(path));
     cli_ensure_dirs();
     FILE* f = fopen(path, "wb");
@@ -410,7 +410,7 @@ void catalog_save_cache(const model_entry_t* entries, int count) {
 }
 
 int catalog_load_cache(model_entry_t* out, int max) {
-    char path[512];
+    char path[1024];
     cli_get_catalog_path(path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -431,18 +431,10 @@ int catalog_refresh(model_entry_t* out, int max, model_type_t type) {
 /* ── Local check ──────────────────────────────────────────────────── */
 
 static int model_is_local(const model_entry_t* m) {
-    char path[512], mdir[512];
+    char path[1024], mdir[1024];
     cli_get_models_dir(mdir, sizeof(mdir));
     snprintf(path, sizeof(path), "%s%c%s", mdir, PATH_SEP, m->filename);
     return cli_file_exists(path);
-}
-
-static const char* fmt_size(double mb) {
-    static char buf[4][32]; static int idx=0; idx=(idx+1)%4;
-    if (mb>=1024) snprintf(buf[idx],32,"%.1fGB",mb/1024.0);
-    else if (mb>0) snprintf(buf[idx],32,"%.0fMB",mb);
-    else snprintf(buf[idx],32,"?");
-    return buf[idx];
 }
 
 /* ── Parameter filter ─────────────────────────────────────────────── */
@@ -539,11 +531,11 @@ int catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* sp
             const model_entry_t* m = &entries[idx[fi]];
             int fits = (!specs||!specs->valid) ? 1 : (specs->tier >= m->min_tier);
 
-            char c_num[8], c_name[20], c_params[8], c_size[8], c_ctx[6], c_quant[8];
+            char c_num[16], c_name[20], c_params[8], c_size[8], c_ctx[6], c_quant[8];
             char c_tools[4], c_visn[4], c_code[4], c_status[8];
 
             snprintf(c_num, sizeof(c_num), "[%2d]", fi+1);
-            strncpy(c_name, m->short_name, 18); c_name[18]='\0';
+            snprintf(c_name, sizeof(c_name), "%.*s", 18, m->short_name);
 
             if (m->params_b > 0) snprintf(c_params, sizeof(c_params), "%.1fB", m->params_b);
             else snprintf(c_params, sizeof(c_params), "-");
@@ -558,7 +550,7 @@ int catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* sp
             else if (m->context_len >= 1024) snprintf(c_ctx, sizeof(c_ctx), "%dK", m->context_len/1024);
             else snprintf(c_ctx, sizeof(c_ctx), "-");
 
-            strncpy(c_quant, m->quant, 7); c_quant[7]='\0';
+            snprintf(c_quant, sizeof(c_quant), "%.*s", 7, m->quant);
             snprintf(c_tools, sizeof(c_tools), "%s", m->has_tools ? "Yes" : "No");
             snprintf(c_visn, sizeof(c_visn), "%s", m->has_vision ? "Yes" : "No");
             snprintf(c_code, sizeof(c_code), "%s", m->has_code ? "Yes" : "No");

@@ -58,7 +58,7 @@ echo ""
 
 # Build object files
 echo "  Compiling kernels..."
-CFLAGS="-O3 -Wall -fPIC -fopenmp -ffast-math -mavx2 -mfma -Iinclude"
+CFLAGS="-O3 -Wall -Wextra -fPIC -fopenmp -ffast-math -mavx2 -mfma -Iinclude"
 
 $CC $CFLAGS -c src/inference.c -o src/inference.o
 $CC $CFLAGS -c src/gguf_loader.c -o src/gguf_loader.o

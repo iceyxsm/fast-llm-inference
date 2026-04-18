@@ -31,20 +31,20 @@ void net_cleanup(void) {
 /* ── PID file ─────────────────────────────────────────────────────── */
 
 void daemon_write_pid(void) {
-    char path[512];
+    char path[1024];
     cli_get_pid_path(path, sizeof(path));
     FILE* f = fopen(path, "w");
     if (f) { fprintf(f, "%d\n%d\n", GETPID(), DAEMON_PORT); fclose(f); }
 }
 
 void daemon_remove_pid(void) {
-    char path[512];
+    char path[1024];
     cli_get_pid_path(path, sizeof(path));
     remove(path);
 }
 
 int daemon_read_pid(int* pid, int* port) {
-    char path[512];
+    char path[1024];
     cli_get_pid_path(path, sizeof(path));
     FILE* f = fopen(path, "r");
     if (!f) return 0;
@@ -96,6 +96,15 @@ int daemon_send(int port, const char* cmd, char* resp, int rsz) {
 
     send(s, cmd, (int)strlen(cmd), 0);
 
+    /* Set receive timeout to 60 seconds */
+#ifdef _WIN32
+    DWORD tv_ms = 60000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv_ms, sizeof(tv_ms));
+#else
+    struct timeval tv_so = { 60, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv_so, sizeof(tv_so));
+#endif
+
     int total = 0;
     while (total < rsz - 1) {
         int n = recv(s, resp + total, rsz - 1 - total, 0);
@@ -111,49 +120,184 @@ int daemon_send(int port, const char* cmd, char* resp, int rsz) {
     return 1;
 }
 
-/* ── Generate tokens (used by daemon) ─────────────────────────────── */
+/* ── Tokenizer using model's real vocabulary ───────────────────────── */
 
-static void run_generate(transformer_model_t* model, int ntok, char* out, int osz) {
+/* BPE-style tokenize: greedy longest match against vocab */
+static int real_tokenize(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
+    int count = 0;
+    tokens[count++] = 1; /* BOS */
+
+    if (!model->vocab_loaded || !model->vocab_tokens) {
+        /* Fallback: hash-based */
+        const char* p = text;
+        while (*p && count < max_tokens - 1) {
+            while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+            if (!*p) break;
+            const char* start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
+            unsigned int hash = 5381;
+            for (const char* c = start; c < p; c++)
+                hash = ((hash << 5) + hash) + (unsigned char)*c;
+            tokens[count++] = 100 + (hash % (model->config.vocab_size - 200));
+        }
+        if (count < max_tokens) tokens[count++] = 2;
+        return count;
+    }
+
+    /* Real tokenization: greedy longest-match against vocab
+       Optimization: only check tokens that start with the current character */
+    int vocab_size = model->config.vocab_size;
+    const char* p = text;
+
+    while (*p && count < max_tokens - 1) {
+        int best_len = 0;
+        int best_id = 3; /* unknown token */
+        unsigned char first_ch = (unsigned char)*p;
+
+        /* Only check vocab entries that start with the same byte */
+        for (int v = 0; v < vocab_size; v++) {
+            const char* tok = model->vocab_tokens[v];
+            if (!tok || tok[0] == '\0') continue;
+            if ((unsigned char)tok[0] != first_ch) {
+                /* Also check for ▁ prefix (0xE2) matching space */
+                if (first_ch == ' ' && (unsigned char)tok[0] == 0xE2) { /* might be ▁ */ }
+                else continue;
+            }
+            int tlen = (int)strlen(tok);
+            if (tlen > best_len && strncmp(p, tok, tlen) == 0) {
+                best_len = tlen;
+                best_id = v;
+            }
+        }
+
+        if (best_len > 0) {
+            tokens[count++] = best_id;
+            p += best_len;
+        } else {
+            /* Single byte fallback — find the byte token */
+            for (int v = 0; v < vocab_size && v < 512; v++) {
+                const char* tok = model->vocab_tokens[v];
+                if (tok && strlen(tok) == 1 && tok[0] == *p) { tokens[count++] = v; break; }
+            }
+            p++;
+        }
+    }
+
+    if (count < max_tokens) tokens[count++] = 2; /* EOS */
+    return count;
+}
+
+/* Detokenize: convert token IDs back to text */
+static int real_detokenize(transformer_model_t* model, const int* tokens, int ntok, char* out, int osz) {
+    int pos = 0;
+    out[0] = '\0';
+
+    if (!model->vocab_loaded || !model->vocab_tokens) {
+        snprintf(out, osz, "[no tokenizer - %d tokens generated]", ntok);
+        return (int)strlen(out);
+    }
+
+    for (int i = 0; i < ntok && pos < osz - 1; i++) {
+        int id = tokens[i];
+        if (id <= 0 || id == 1 || id == 2) continue; /* skip PAD, BOS, EOS */
+        if (id >= model->config.vocab_size) continue;
+
+        const char* tok = model->vocab_tokens[id];
+        if (!tok) continue;
+
+        /* BPE tokens often have "▁" (U+2581) for space — replace with actual space */
+        const char* p = tok;
+        while (*p && pos < osz - 1) {
+            /* Check for ▁ (UTF-8: 0xE2 0x96 0x81) */
+            if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81) {
+                out[pos++] = ' ';
+                p += 3;
+            } else {
+                out[pos++] = *p++;
+            }
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+/* ── Generate with real tokenizer ─────────────────────────────────── */
+
+static void run_chat(transformer_model_t* model, const char* user_msg, int ntok, char* out, int osz) {
     int vocab = model->config.vocab_size;
+    fprintf(stderr, "[run_chat] vocab=%d msg='%s' ntok=%d\n", vocab, user_msg, ntok);
+    fflush(stderr);
+
     float* logits = (float*)aligned_malloc(vocab * sizeof(float), 64);
     int* ctx = (int*)malloc(2048 * sizeof(int));
     int ctx_len = 0;
 
-    int seed[] = { 1, 450, 6593, 310, 2834, 338 };
-    for (int i = 0; i < 6; i++) ctx[ctx_len++] = seed[i];
+    /* Tokenize user message with real vocab */
+    fprintf(stderr, "[run_chat] tokenizing...\n"); fflush(stderr);
+    ctx_len = real_tokenize(model, user_msg, ctx, 512);
+    fprintf(stderr, "[run_chat] tokenized: %d tokens\n", ctx_len); fflush(stderr);
 
     double start = cli_time_sec();
     int gen = 0;
+    int out_tokens[512];
 
     for (int t = 0; t < ntok; t++) {
         int next = 0;
+        fprintf(stderr, "[run_chat] forward pass %d/%d ctx_len=%d...\n", t+1, ntok, ctx_len); fflush(stderr);
         model_forward(model, ctx, ctx_len, logits, &next);
+
+        /* Greedy argmax */
         float best = logits[0]; int bid = 0;
         for (int v = 1; v < vocab; v++)
             if (logits[v] > best) { best = logits[v]; bid = v; }
         next = bid;
+
         if (ctx_len < 2048) ctx[ctx_len++] = next;
         else { memmove(ctx, ctx+64, (ctx_len-64)*sizeof(int)); ctx_len -= 64; ctx[ctx_len++] = next; }
+
+        out_tokens[gen] = next;
         gen++;
+        /* Stop on EOS (2), or if model is stuck generating same token */
         if (next == 2) break;
+        if (gen >= 3 && out_tokens[gen-1] == out_tokens[gen-2] && out_tokens[gen-2] == out_tokens[gen-3]) break;
     }
 
     double elapsed = cli_time_sec() - start;
-    snprintf(out, osz,
-        "Generated %d tokens in %.2f sec\n"
-        "Speed: %.2f tok/sec (%.2f ms/token)\n"
-        "Model: %s (%d layers, Q%d)\n",
-        gen, elapsed, gen/elapsed, (elapsed/gen)*1000.0,
-        model->config.model_name, model->config.num_layers, model->config.quant_bits);
+    double tps = (elapsed > 0.001) ? gen / elapsed : 0;
+    fprintf(stderr, "[run_chat] generated %d tokens in %.2fs, first token=%d\n", gen, elapsed, gen > 0 ? out_tokens[0] : -1);
+    fflush(stderr);
+
+    /* Detokenize the generated tokens */
+    char text_out[2048] = {0};
+    real_detokenize(model, out_tokens, gen, text_out, sizeof(text_out));
+
+    int pos = 0;
+    if (text_out[0]) {
+        pos += snprintf(out + pos, osz - pos, "%s", text_out);
+    } else if (gen > 0) {
+        /* Show raw token IDs if detokenizer produced nothing */
+        pos += snprintf(out + pos, osz - pos, "[tokens:");
+        for (int i = 0; i < gen && i < 20; i++)
+            pos += snprintf(out + pos, osz - pos, " %d", out_tokens[i]);
+        if (gen > 20) pos += snprintf(out + pos, osz - pos, " ...");
+        pos += snprintf(out + pos, osz - pos, "]");
+    }
+    pos += snprintf(out + pos, osz - pos,
+        "\n  [%d tokens | %.1f tok/s | %.0fms]",
+        gen, tps, elapsed * 1000.0);
 
     free(ctx); aligned_free(logits);
+}
+
+static void run_generate(transformer_model_t* model, int ntok, char* out, int osz) {
+    run_chat(model, "The meaning of life is", ntok, out, osz);
 }
 
 /* ── Handle daemon command ────────────────────────────────────────── */
 
 static void handle_cmd(const char* raw, char* resp, int rsz) {
-    char cmd[256];
-    strncpy(cmd, raw, sizeof(cmd)-1); cmd[sizeof(cmd)-1] = '\0';
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "%s", raw);
     /* Trim */
     while (cmd[0] == ' ') memmove(cmd, cmd+1, strlen(cmd));
     int len = (int)strlen(cmd);
@@ -173,8 +317,30 @@ static void handle_cmd(const char* raw, char* resp, int rsz) {
         int n = 50;
         char* sp = strchr(cmd, ' ');
         if (sp) n = atoi(sp+1);
-        if (n < 1) n = 50; if (n > 500) n = 500;
+        if (n < 1)
+            n = 50;
+        if (n > 500)
+            n = 500;
         run_generate(g_model, n, resp, rsz);
+    }
+    else if (strncmp(cmd, "chat ", 5) == 0) {
+        if (!g_model) { snprintf(resp, rsz, "No model loaded.\n"); return; }
+        /* Format: "chat <max_tokens> <user message>" */
+        const char* rest = cmd + 5;
+        int n = 256;
+        /* Try to parse token count */
+        char* endp = NULL;
+        long val = strtol(rest, &endp, 10);
+        const char* msg = rest;
+        if (endp && endp != rest && *endp == ' ') {
+            n = (int)val;
+            msg = endp + 1;
+        }
+        if (n < 1)
+            n = 1;
+        if (n > 500)
+            n = 500;
+        run_chat(g_model, msg, n, resp, rsz);
     }
     else if (strcmp(cmd, "bench") == 0) {
         if (!g_model) { snprintf(resp, rsz, "No model loaded.\n"); return; }
@@ -250,7 +416,7 @@ void daemon_serve(const char* model_path) {
         sock_t cl = accept(srv, NULL, NULL);
         if (cl == SOCK_INVALID) continue;
 
-        char buf[1024] = {0};
+        char buf[4096] = {0};
         int n = recv(cl, buf, sizeof(buf)-1, 0);
         if (n > 0) {
             buf[n] = '\0';
@@ -273,7 +439,7 @@ void daemon_serve(const char* model_path) {
 
 void daemon_start_detached(const char* model_path) {
 #ifdef _WIN32
-    char exe[512], cmdline[1024];
+    char exe[1024], cmdline[2048];
     GetModuleFileNameA(NULL, exe, sizeof(exe));
     if (model_path && model_path[0])
         snprintf(cmdline, sizeof(cmdline), "\"%s\" --_daemon --model \"%s\"", exe, model_path);
@@ -296,7 +462,7 @@ void daemon_start_detached(const char* model_path) {
     if (pid < 0) { perror("fork"); return; }
     if (pid > 0) { printf("  Daemon started (PID %d)\n", pid); return; }
     setsid();
-    char logpath[512];
+    char logpath[1024];
     cli_get_log_path(logpath, sizeof(logpath));
     FILE* lf = freopen(logpath, "a", stdout);
     if (lf) freopen(logpath, "a", stderr);

@@ -212,55 +212,36 @@ typedef enum {
 static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
     *layer = -1;
     *proj = PROJ_UNKNOWN;
-    
+
+    /* Extract layer number FIRST */
+    const char* blk = strstr(name, "blk.");
+    if (blk) *layer = atoi(blk + 4);
+
     /* Token embeddings */
     if (strstr(name, "token_embd") || strstr(name, "tok_embeddings")) {
-        *proj = PROJ_EMBED;
-        return;
+        *proj = PROJ_EMBED; *layer = -1; return;
     }
-    
-    /* LM head - but not attention output */
-    if ((strstr(name, "output") && !strstr(name, "attn_")) || strstr(name, "lm_head")) {
-        *proj = PROJ_LM_HEAD;
-        return;
+
+    /* LM head */
+    if (strstr(name, "lm_head")) { *proj = PROJ_LM_HEAD; *layer = -1; return; }
+    if ((strstr(name, "output.weight") || strstr(name, "output_norm.weight")) && *layer < 0) {
+        *proj = PROJ_LM_HEAD; return;
     }
-    
-    /* Layer norms */
-    if (strstr(name, "norm")) {
-        *proj = PROJ_NORM;
-        return;
-    }
-    
-    /* Extract layer number first if blk. present */
-    if (strstr(name, "blk.")) {
-        const char* p = strstr(name, "blk.");
-        if (p) {
-            *layer = atoi(p + 4);
-        }
-    }
-    
+
+    /* Layer norms (only if inside a block) */
+    if (*layer >= 0 && strstr(name, "norm")) { *proj = PROJ_NORM; return; }
+
     /* Attention projections */
-    if (strstr(name, "attn_") || strstr(name, "self_attn")) {
-        if (strstr(name, "attn_q") || strstr(name, "q_proj")) *proj = PROJ_Q;
-        else if (strstr(name, "attn_k") || strstr(name, "k_proj")) *proj = PROJ_K;
-        else if (strstr(name, "attn_v") || strstr(name, "v_proj")) *proj = PROJ_V;
-        else if (strstr(name, "attn_output") || strstr(name, "attn_o") || strstr(name, "o_proj")) *proj = PROJ_O;
-        /* Phi-3 fused QKV: map to Q for now (would need special handling) */
-        else if (strstr(name, "attn_qkv")) *proj = PROJ_Q;
-    }
-    
-    /* FFN projections - handle both llama.cpp and HF naming */
-    if (strstr(name, "ffn_") || strstr(name, "mlp.") || strstr(name, "feed_forward")) {
-        if (strstr(name, "ffn_gate") || strstr(name, "gate_proj")) *proj = PROJ_GATE;
-        else if (strstr(name, "ffn_up") || strstr(name, "up_proj")) *proj = PROJ_UP;
-        else if (strstr(name, "ffn_down") || strstr(name, "down_proj")) *proj = PROJ_DOWN;
-    }
-    
-    /* Alternative naming */
-    if (strstr(name, "attn_qkv")) {
-        /* QKV fused - would need special handling */
-        *proj = PROJ_Q;  /* Placeholder */
-    }
+    if (strstr(name, "attn_q") || strstr(name, "q_proj")) { *proj = PROJ_Q; return; }
+    if (strstr(name, "attn_k") || strstr(name, "k_proj")) { *proj = PROJ_K; return; }
+    if (strstr(name, "attn_v") || strstr(name, "v_proj")) { *proj = PROJ_V; return; }
+    if (strstr(name, "attn_output") || strstr(name, "attn_o") || strstr(name, "o_proj")) { *proj = PROJ_O; return; }
+    if (strstr(name, "attn_qkv")) { *proj = PROJ_Q; return; }
+
+    /* FFN projections */
+    if (strstr(name, "ffn_gate") || strstr(name, "gate_proj")) { *proj = PROJ_GATE; return; }
+    if (strstr(name, "ffn_up") || strstr(name, "up_proj")) { *proj = PROJ_UP; return; }
+    if (strstr(name, "ffn_down") || strstr(name, "down_proj")) { *proj = PROJ_DOWN; return; }
 }
 
 /* Load GGUF file and create model with real weights */
@@ -304,6 +285,8 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     };
     
     /* Read metadata */
+    char** temp_vocab = NULL;
+    int temp_vocab_size = 0;
     for (uint64_t i = 0; i < num_metadata; i++) {
         char* key = read_string(f);
         int type = read_i32(f);
@@ -327,7 +310,23 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                    strcmp(key, "llama.context_length") == 0) {
             config.max_seq_len = read_i32(f);
         } else if (strcmp(key, "tokenizer.ggml.tokens") == 0) {
-            skip_value(f, type);  /* Skip array */
+            /* Read vocabulary: array of strings */
+            if (type == 9) { /* array type */
+                int arr_type = read_i32(f);
+                uint64_t arr_len = read_u64(f);
+                if (arr_type == 8 && arr_len > 0 && arr_len <= 200000) {
+                    /* Store temporarily — will attach to model later */
+                    temp_vocab = (char**)malloc(arr_len * sizeof(char*));
+                    temp_vocab_size = (int)arr_len;
+                    for (uint64_t i = 0; i < arr_len; i++) {
+                        temp_vocab[i] = read_string(f);
+                    }
+                } else {
+                    for (uint64_t i = 0; i < arr_len; i++) skip_value(f, arr_type);
+                }
+            } else {
+                skip_value(f, type);
+            }
         } else {
             skip_value(f, type);
         }
@@ -336,6 +335,14 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     }
     
     config.head_dim = config.hidden_size / config.num_heads;
+
+    /* Update vocab size from tokenizer if loaded AND no metadata vocab_size was set */
+    if (temp_vocab_size > 0 && config.vocab_size <= 32064) {
+        /* Cap at a reasonable size to avoid huge allocations */
+        /* The actual embedding tensor will tell us the real size */
+        config.vocab_size = temp_vocab_size;
+        if (config.vocab_size > 200000) config.vocab_size = 200000;
+    }
     
     printf("\nArchitecture:\n");
     printf("  Hidden size: %d\n", config.hidden_size);
@@ -346,7 +353,6 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     
     /* Read tensor info */
     tensor_info_t* tensors = calloc(num_tensors, sizeof(tensor_info_t));
-    size_t data_offset = 0;
     
     for (uint64_t i = 0; i < num_tensors; i++) {
         tensors[i].name = read_string(f);
@@ -368,25 +374,29 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         
         /* Align to 32 bytes */
         tensors[i].size = (tensors[i].size + 31) & ~31;
-        
-        if (tensors[i].offset > data_offset) {
-            data_offset = tensors[i].offset;
-        }
     }
     
-    /* Align to 32 bytes */
-    data_offset = (data_offset + 31) & ~31;
-    
-    printf("\nData offset: %zu\n", data_offset);
+    /* The data section starts right after tensor info, aligned to 32 bytes.
+       Tensor offsets are RELATIVE to the data section start. */
+    long current_pos = ftell(f);
+    size_t data_start = (current_pos + 31) & ~(size_t)31;
+
+    printf("\nData section at file offset: %zu\n", data_start);
     printf("Loading %llu tensors...\n\n", (unsigned long long)num_tensors);
-    
-    /* Seek to data section */
-    fseek(f, data_offset, SEEK_SET);
+
+    /* Read each tensor by seeking to data_start + tensor.offset */
     
     /* Allocate model */
     transformer_model_t* model = calloc(1, sizeof(transformer_model_t));
     model->config = config;
     strcpy(model->config.model_name, "Phi-3-Mini-Real");
+
+    /* Attach tokenizer vocabulary if loaded */
+    if (temp_vocab && temp_vocab_size > 0) {
+        model->vocab_tokens = temp_vocab;
+        model->vocab_loaded = 1;
+        printf("  Tokenizer: %d tokens loaded\n", temp_vocab_size);
+    }
     
     /* Allocate weight arrays */
     model->q_proj = calloc(config.num_layers, sizeof(dequantized_tensor_t*));
@@ -425,6 +435,9 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     
     /* Read and process each tensor */
     for (uint64_t i = 0; i < num_tensors; i++) {
+        /* Seek to this tensor's data: data_start + tensor offset */
+        fseek(f, (long)(data_start + tensors[i].offset), SEEK_SET);
+
         /* Read tensor data */
         void* tensor_data = malloc(tensors[i].size);
         if (!tensor_data) {
@@ -582,15 +595,123 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 }
                 dequantized_tensor_free(dt);
             }
+        } else if (tensors[i].type == GGML_TYPE_F16) {
+            /* Handle float16 tensors — convert to f32 then to int8 dequantized */
+            int num_elements = rows * cols;
+            float* f32_data = aligned_malloc(num_elements * sizeof(float), 64);
+
+            /* Convert F16 to F32 */
+            const uint16_t* f16 = (const uint16_t*)tensor_data;
+            for (int e = 0; e < num_elements; e++) {
+                /* IEEE 754 half-precision to single-precision */
+                uint16_t h = f16[e];
+                uint32_t sign = (h & 0x8000) << 16;
+                uint32_t exp  = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) { f = sign; }
+                    else { /* subnormal */
+                        exp = 1;
+                        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                        mant &= 0x3FF;
+                        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+                    }
+                } else if (exp == 31) {
+                    f = sign | 0x7F800000 | (mant << 13); /* inf/nan */
+                } else {
+                    f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+                }
+                memcpy(&f32_data[e], &f, 4);
+            }
+
+            /* Handle embeddings (store as float directly) */
+            if (proj_type == PROJ_EMBED) {
+                for (int r = 0; r < rows && r < config.vocab_size; r++) {
+                    for (int c = 0; c < cols && c < config.hidden_size; c++) {
+                        model->token_embeddings[r * config.hidden_size + c] = f32_data[r * cols + c];
+                    }
+                }
+                aligned_free(f32_data);
+                loaded_tensors++;
+                total_bytes += num_elements * 2;
+            }
+            /* Handle norms (store as float) */
+            else if (proj_type == PROJ_NORM && layer_idx >= 0 && layer_idx < config.num_layers) {
+                if (strstr(tensors[i].name, "attn_norm") || strstr(tensors[i].name, "input_layernorm")) {
+                    model->input_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
+                    memcpy(model->input_layernorm[layer_idx], f32_data, rows * sizeof(float));
+                    loaded_tensors++;
+                } else if (strstr(tensors[i].name, "ffn_norm") || strstr(tensors[i].name, "post_attention_layernorm")) {
+                    model->post_attn_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
+                    memcpy(model->post_attn_layernorm[layer_idx], f32_data, rows * sizeof(float));
+                    loaded_tensors++;
+                }
+                aligned_free(f32_data);
+            }
+            /* Handle weight matrices (convert to int8 dequantized) */
+            else {
+                dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
+                dt->rows = rows;
+                dt->cols = cols;
+                dt->weights = aligned_malloc(rows * cols, 64);
+                dt->scales = aligned_malloc(rows * sizeof(float), 64);
+
+                for (int r = 0; r < rows; r++) {
+                    float max_abs = 0.0f;
+                    for (int c = 0; c < cols; c++) {
+                        float v = fabsf(f32_data[r * cols + c]);
+                        if (v > max_abs) max_abs = v;
+                    }
+                    dt->scales[r] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
+                    float inv_scale = 1.0f / dt->scales[r];
+                    for (int c = 0; c < cols; c++) {
+                        float scaled = f32_data[r * cols + c] * inv_scale;
+                        if (scaled > 127) scaled = 127;
+                        if (scaled < -128) scaled = -128;
+                        dt->weights[r * cols + c] = (int8_t)roundf(scaled);
+                    }
+                }
+                aligned_free(f32_data);
+
+                /* Store in appropriate slot */
+                if (layer_idx >= 0 && layer_idx < config.num_layers) {
+                    switch (proj_type) {
+                        case PROJ_Q: model->q_proj[layer_idx] = dt; break;
+                        case PROJ_K: model->k_proj[layer_idx] = dt; break;
+                        case PROJ_V: model->v_proj[layer_idx] = dt; break;
+                        case PROJ_O: model->o_proj[layer_idx] = dt; break;
+                        case PROJ_GATE: model->gate_proj[layer_idx] = dt; break;
+                        case PROJ_UP: model->up_proj[layer_idx] = dt; break;
+                        case PROJ_DOWN: model->down_proj[layer_idx] = dt; break;
+                        default: dequantized_tensor_free(dt); dt = NULL; break;
+                    }
+                    if (dt) { loaded_tensors++; total_bytes += rows * cols * 2; }
+                } else if (proj_type == PROJ_LM_HEAD) {
+                    aligned_free(model->lm_head->weights);
+                    aligned_free(model->lm_head->scales);
+                    free(model->lm_head);
+                    model->lm_head = dt;
+                    loaded_tensors++;
+                } else {
+                    if (unmapped_tensors < 10) {
+                        printf("  [Unmapped F16: %s layer=%d proj=%d]\n", tensors[i].name, layer_idx, proj_type);
+                        unmapped_tensors++;
+                    }
+                    dequantized_tensor_free(dt);
+                }
+            }
         } else if (tensors[i].type == GGML_TYPE_F32) {
-            /* Handle float32 tensors (usually norms) */
+            /* Handle float32 tensors (norms, biases) */
             if (proj_type == PROJ_NORM && layer_idx >= 0 && layer_idx < config.num_layers) {
-                if (strstr(tensors[i].name, "ln1") || strstr(tensors[i].name, "input_layernorm")) {
+                if (strstr(tensors[i].name, "attn_norm") || strstr(tensors[i].name, "input_layernorm") || strstr(tensors[i].name, "ln1")) {
                     model->input_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
                     memcpy(model->input_layernorm[layer_idx], tensor_data, rows * sizeof(float));
-                } else if (strstr(tensors[i].name, "ln2") || strstr(tensors[i].name, "post_attention_layernorm")) {
+                    loaded_tensors++;
+                } else if (strstr(tensors[i].name, "ffn_norm") || strstr(tensors[i].name, "post_attention_layernorm") || strstr(tensors[i].name, "ln2")) {
                     model->post_attn_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
                     memcpy(model->post_attn_layernorm[layer_idx], tensor_data, rows * sizeof(float));
+                    loaded_tensors++;
                 }
             }
         }
@@ -777,7 +898,14 @@ void model_free(transformer_model_t* model) {
     if (model->token_embeddings) aligned_free(model->token_embeddings);
     if (model->k_cache) aligned_free(model->k_cache);
     if (model->v_cache) aligned_free(model->v_cache);
-    
+
+    /* Free tokenizer vocab */
+    if (model->vocab_tokens) {
+        for (int i = 0; i < model->config.vocab_size; i++)
+            if (model->vocab_tokens[i]) free(model->vocab_tokens[i]);
+        free(model->vocab_tokens);
+    }
+
     free(model);
 }
 

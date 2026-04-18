@@ -30,20 +30,20 @@ chat_config_t chat_default_config(void) {
 /* Config files stored as: ~/.fllm/configs/<model_name>.cfg (binary) */
 
 static void get_config_dir(char* buf, int sz) {
-    char fdir[512];
+    char fdir[1024];
     cli_get_fllm_dir(fdir, sizeof(fdir));
     snprintf(buf, sz, "%s%cconfigs", fdir, PATH_SEP);
 }
 
 static void get_config_path(const char* model_name, char* buf, int sz) {
-    char cdir[512];
+    char cdir[1024];
     get_config_dir(cdir, sizeof(cdir));
     snprintf(buf, sz, "%s%c%s.cfg", cdir, PATH_SEP, model_name);
 }
 
 void chat_save_config(const chat_config_t* cfg) {
     if (cfg->model_name[0] == '\0') return;
-    char cdir[512], path[512];
+    char cdir[1024], path[1024];
     get_config_dir(cdir, sizeof(cdir));
     MKDIR_P(cdir);
     get_config_path(cfg->model_name, path, sizeof(path));
@@ -52,7 +52,7 @@ void chat_save_config(const chat_config_t* cfg) {
 }
 
 int chat_load_config(const char* model_name, chat_config_t* cfg) {
-    char path[512];
+    char path[1024];
     get_config_path(model_name, path, sizeof(path));
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -64,13 +64,13 @@ int chat_load_config(const char* model_name, chat_config_t* cfg) {
 /* ── Default model persistence ────────────────────────────────────── */
 
 static void get_default_model_path(char* buf, int sz) {
-    char fdir[512];
+    char fdir[1024];
     cli_get_fllm_dir(fdir, sizeof(fdir));
     snprintf(buf, sz, "%s%cdefault_model.txt", fdir, PATH_SEP);
 }
 
 void chat_set_default_model(const char* model_path) {
-    char path[512];
+    char path[1024];
     get_default_model_path(path, sizeof(path));
     cli_ensure_dirs();
     FILE* f = fopen(path, "w");
@@ -78,7 +78,7 @@ void chat_set_default_model(const char* model_path) {
 }
 
 int chat_get_default_model(char* out, int sz) {
-    char path[512];
+    char path[1024];
     get_default_model_path(path, sizeof(path));
     FILE* f = fopen(path, "r");
     if (!f) return 0;
@@ -91,7 +91,7 @@ int chat_get_default_model(char* out, int sz) {
 /* ── Quick Start ──────────────────────────────────────────────────── */
 
 void chat_quick_start(void) {
-    char model_path[512] = {0};
+    char model_path[1024] = {0};
 
     if (!chat_get_default_model(model_path, sizeof(model_path))) {
         /* No default set — try first available model */
@@ -104,11 +104,11 @@ void chat_quick_start(void) {
 
     /* Load saved config for this model, or use defaults */
     chat_config_t cfg = chat_default_config();
-    strncpy(cfg.model_path, model_path, sizeof(cfg.model_path)-1);
+    snprintf(cfg.model_path, sizeof(cfg.model_path), "%s", model_path);
 
     const char* fn = strrchr(model_path, PATH_SEP);
     if (fn) fn++; else fn = model_path;
-    strncpy(cfg.model_name, fn, sizeof(cfg.model_name)-1);
+    snprintf(cfg.model_name, sizeof(cfg.model_name), "%s", fn);
     char* ext = strstr(cfg.model_name, ".gguf");
     if (ext) *ext = '\0';
 
@@ -116,12 +116,12 @@ void chat_quick_start(void) {
     chat_config_t saved;
     if (chat_load_config(cfg.model_name, &saved)) {
         /* Restore saved params but keep the model path fresh */
-        char mp[512], mn[64];
-        strncpy(mp, cfg.model_path, sizeof(mp)-1); mp[sizeof(mp)-1]='\0';
-        strncpy(mn, cfg.model_name, sizeof(mn)-1); mn[sizeof(mn)-1]='\0';
+        char mp[1024], mn[64];
+        snprintf(mp, sizeof(mp), "%s", cfg.model_path);
+        snprintf(mn, sizeof(mn), "%s", cfg.model_name);
         cfg = saved;
-        strncpy(cfg.model_path, mp, sizeof(cfg.model_path)-1);
-        strncpy(cfg.model_name, mn, sizeof(cfg.model_name)-1);
+        snprintf(cfg.model_path, sizeof(cfg.model_path), "%s", mp);
+        snprintf(cfg.model_name, sizeof(cfg.model_name), "%s", mn);
     }
 
     printf("\n  Quick Start: ");
@@ -165,7 +165,7 @@ static int select_model(chat_config_t* cfg) {
 
         /* Show clean name */
         char disp[32];
-        strncpy(disp, fname, 31); disp[31] = '\0';
+        snprintf(disp, sizeof(disp), "%s", fname);
         char* ext = strstr(disp, ".gguf"); if (ext) *ext = '\0';
         /* Truncate to 28 chars */
         if (strlen(disp) > 28) { disp[25] = '.'; disp[26] = '.'; disp[27] = '.'; disp[28] = '\0'; }
@@ -182,13 +182,60 @@ static int select_model(chat_config_t* cfg) {
     int choice = cli_prompt_choice(nlocal);
     if (choice <= 0) return 0;
 
-    strncpy(cfg->model_path, locals[choice-1], sizeof(cfg->model_path)-1);
+    snprintf(cfg->model_path, sizeof(cfg->model_path), "%s", locals[choice-1]);
     const char* fn = strrchr(cfg->model_path, PATH_SEP);
     if (fn) fn++; else fn = cfg->model_path;
-    strncpy(cfg->model_name, fn, sizeof(cfg->model_name)-1);
+    snprintf(cfg->model_name, sizeof(cfg->model_name), "%s", fn);
     /* Trim .gguf */
     char* ext = strstr(cfg->model_name, ".gguf");
     if (ext) *ext = '\0';
+
+    /* Set smart defaults based on model properties */
+    FILE* mf = fopen(cfg->model_path, "rb");
+    double model_mb = 0;
+    if (mf) { fseek(mf, 0, SEEK_END); model_mb = ftell(mf) / (1024.0*1024.0); fclose(mf); }
+
+    /* Guess params from name */
+    double params = 0;
+    const char* pp = cfg->model_name;
+    while (*pp) {
+        if ((*pp>='0'&&*pp<='9')||*pp=='.') {
+            double v = atof(pp);
+            while (*pp&&((*pp>='0'&&*pp<='9')||*pp=='.')) pp++;
+            if (*pp=='B'||*pp=='b') { params = v; break; }
+        }
+        pp++;
+    }
+
+    /* Adjust defaults based on model size */
+    if (params >= 7.0) {
+        cfg->max_tokens = 128;
+        cfg->context_window = 4096;
+    } else if (params >= 3.0) {
+        cfg->max_tokens = 256;
+        cfg->context_window = 4096;
+    } else if (params >= 1.0) {
+        cfg->max_tokens = 256;
+        cfg->context_window = 2048;
+    } else {
+        cfg->max_tokens = 512;
+        cfg->context_window = 2048;
+    }
+
+    /* FP16 models are bigger but same params — adjust context */
+    if (strstr(cfg->model_name, "fp16") || strstr(cfg->model_name, "f16")) {
+        cfg->context_window = 2048; /* FP16 uses more memory */
+    }
+
+    /* Qwen models support longer context */
+    if (strstr(cfg->model_name, "qwen") || strstr(cfg->model_name, "Qwen")) {
+        cfg->context_window = 4096;
+    }
+
+    /* Llama 3.x supports very long context */
+    if (strstr(cfg->model_name, "Llama-3") || strstr(cfg->model_name, "llama-3")) {
+        cfg->context_window = 8192;
+    }
 
     return 1;
 }
@@ -354,12 +401,12 @@ void chat_run(chat_config_t* cfg) {
         /* Try loading saved config for this model */
         chat_config_t saved;
         if (chat_load_config(cfg->model_name, &saved)) {
-            char mp[512], mn[64];
-            strncpy(mp, cfg->model_path, sizeof(mp)-1); mp[sizeof(mp)-1]='\0';
-            strncpy(mn, cfg->model_name, sizeof(mn)-1); mn[sizeof(mn)-1]='\0';
+            char mp[1024], mn[64];
+            snprintf(mp, sizeof(mp), "%s", cfg->model_path);
+            snprintf(mn, sizeof(mn), "%s", cfg->model_name);
             *cfg = saved;
-            strncpy(cfg->model_path, mp, sizeof(cfg->model_path)-1);
-            strncpy(cfg->model_name, mn, sizeof(cfg->model_name)-1);
+            snprintf(cfg->model_path, sizeof(cfg->model_path), "%s", mp);
+            snprintf(cfg->model_name, sizeof(cfg->model_name), "%s", mn);
         }
     }
 
@@ -499,21 +546,33 @@ void chat_run(chat_config_t* cfg) {
             continue;
         }
 
-        /* Send generate command to daemon */
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "gen %d", cfg->max_tokens);
+        /* Send user message to daemon */
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "chat %d %s", cfg->max_tokens, input);
 
         char resp[4096]={0};
         printf("\n  ");
         cli_color(CLR_CYAN);
         printf("AI> ");
         cli_reset();
+        printf("thinking...");
         fflush(stdout);
 
         if (daemon_send(port, cmd, resp, sizeof(resp))) {
-            printf("%s\n\n", resp);
+            /* Clear "thinking..." and show response */
+            printf("\r  ");
+            cli_color(CLR_CYAN);
+            printf("AI> ");
+            cli_reset();
+            if (resp[0]) {
+                printf("%s\n", resp);
+            } else {
+                printf("[no response]\n");
+            }
         } else {
-            cli_cprint("Connection lost.\n\n", CLR_RED);
+            printf("\r  ");
+            cli_cprint("AI> ", CLR_CYAN);
+            cli_cprint("Connection lost or timeout.\n\n", CLR_RED);
             break;
         }
     }

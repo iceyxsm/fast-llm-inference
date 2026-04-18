@@ -72,6 +72,10 @@ typedef struct {
     float* k_cache;
     float* v_cache;
     int cache_pos;
+
+    /* Tokenizer vocabulary (loaded from GGUF) */
+    char** vocab_tokens;     /* [vocab_size] token strings */
+    int    vocab_loaded;
 } transformer_model_t;
 
 /* Load model from GGUF file */
