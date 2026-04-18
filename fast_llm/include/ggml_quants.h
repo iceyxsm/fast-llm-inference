@@ -15,22 +15,29 @@ extern "C" {
 #endif
 
 /* Q4_K block - 256 weights per block */
+/* Based on llama.cpp ggml-common.h */
 typedef struct {
-    uint8_t scales[12];  /* 6-bit scales and mins packed */
-    uint8_t qs[128];     /* 256 4-bit values */
+    uint16_t d;            /* super-block scale (f16) */
+    uint16_t dmin;         /* super-block min (f16) */
+    uint8_t scales[12];    /* 6-bit scales and mins packed */
+    uint8_t qs[128];       /* 256 4-bit values */
 } block_q4_K;
 
 /* Q5_K block */
 typedef struct {
-    uint8_t scales[12];
-    uint8_t qh[32];      /* 256 high bits */
-    uint8_t qs[128];     /* 256 low bits */
+    uint16_t d;            /* super-block scale (f16) */
+    uint16_t dmin;         /* super-block min (f16) */
+    uint8_t scales[12];    /* 6-bit scales and mins packed */
+    uint8_t qh[32];        /* 256 high bits */
+    uint8_t qs[128];       /* 256 low 4 bits */
 } block_q5_K;
 
 /* Q6_K block */
 typedef struct {
-    uint8_t scales[16];  /* 16 scales */
-    uint8_t qs[192];     /* 256 6-bit values */
+    uint8_t ql[128];       /* quants, lower 4 bits */
+    uint8_t qh[64];        /* quants, upper 2 bits */
+    int8_t  scales[16];    /* scales, quantized with 8 bits */
+    uint16_t d;            /* super-block scale (f16) */
 } block_q6_K;
 
 /* 

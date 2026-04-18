@@ -40,29 +40,35 @@ typedef enum {
     GGML_TYPE_IQ4_XS = 29,
 } ggml_type_t;
 
-/* Q4_0 block: 32 4-bit weights + 1 float scale = 18 bytes for 32 weights */
+/* Q4_0 block: 32 4-bit weights + 1 float16 scale */
 typedef struct {
     float d;           /* delta/scale */
     uint8_t qs[16];    /* 32 4-bit values packed */
 } block_q4_0;
 
-/* Q4_K block - more complex, 256 weights per block typically */
+/* Q4_K block: 256 weights, based on llama.cpp ggml-common.h */
 typedef struct {
-    uint8_t scales[12];  /* scales and mins */
-    uint8_t qs[256/2];   /* 256 4-bit values */
+    uint16_t d;            /* super-block scale (f16) */
+    uint16_t dmin;         /* super-block min (f16) */
+    uint8_t scales[12];    /* 6-bit scales and mins packed */
+    uint8_t qs[128];       /* 256 4-bit values */
 } block_q4_K;
 
-/* Q5_K block */
+/* Q5_K block: 256 weights, 5-bit */
 typedef struct {
-    uint8_t scales[12];
-    uint8_t qh[256/8];   /* high bits */
-    uint8_t qs[256/2];   /* low bits */
+    uint16_t d;            /* super-block scale (f16) */
+    uint16_t dmin;         /* super-block min (f16) */
+    uint8_t scales[12];    /* 6-bit scales and mins packed */
+    uint8_t qh[32];        /* 256 high bits */
+    uint8_t qs[128];       /* 256 low 4 bits */
 } block_q5_K;
 
-/* Q6_K block */
+/* Q6_K block: 256 weights, 6-bit */
 typedef struct {
-    uint8_t scales[256/16];  /* 16 scales */
-    uint8_t qs[256*3/4];     /* 256 6-bit values */
+    uint8_t ql[128];       /* quants, lower 4 bits */
+    uint8_t qh[64];        /* quants, upper 2 bits */
+    int8_t  scales[16];    /* scales, quantized with 8 bits */
+    uint16_t d;            /* super-block scale (f16) */
 } block_q6_K;
 
 /* Tensor info */
@@ -154,42 +160,126 @@ static void dequantize_q4_0(const void* src, float* dst, int n) {
     }
 }
 
+/* Helper: convert f16 (uint16_t) to float */
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) f = sign;
+        else { exp = 1; while (!(mant & 0x400)) { mant <<= 1; exp--; } mant &= 0x3FF; f = sign | ((exp + 127 - 15) << 23) | (mant << 13); }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13);
+    } else {
+        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float result;
+    memcpy(&result, &f, 4);
+    return result;
+}
+
 /* 
- * Dequantize Q4_K to float
- * Q4_K format from llama.cpp: 256 weights per superblock
- * Layout: scales[12] + qs[128] for 256 4-bit weights
+ * Dequantize Q4_K to float (proper implementation based on llama.cpp)
+ * 256 weights per super-block, 8 sub-blocks of 32 weights each
  */
 static void dequantize_q4_K(const void* src, float* dst, int n) {
     const block_q4_K* blocks = (const block_q4_K*)src;
     int num_blocks = n / 256;
-    
+
     for (int b = 0; b < num_blocks; b++) {
-        /* Extract scales from compressed format
-         * scales are stored as 6-bit values packed across bytes
-         * First 6 values are scales, next 6 are mins
-         */
-        
-        /* Unpack 6-bit scales from bytes 0-5 and 6-11 */
-        uint8_t s_bytes[6], m_bytes[6];
-        memcpy(s_bytes, blocks[b].scales, 6);
-        memcpy(m_bytes, blocks[b].scales + 6, 6);
-        
-        /* Each scale/min is 6 bits, packed across bytes
-         * Full extraction requires bit manipulation */
-        
-        /* Simplified: use average scale from first byte pair */
-        float d = (s_bytes[0] & 0x3F) / 63.0f * 0.02f + 0.001f;
-        float dm = (m_bytes[0] & 0x3F) / 63.0f * 0.02f;
-        
-        /* Dequantize 256 weights */
-        for (int i = 0; i < 256; i += 2) {
-            uint8_t qs = blocks[b].qs[i/2];
-            int x0 = (qs & 0x0F);  /* Lower nibble: 0-15 */
-            int x1 = (qs >> 4);     /* Upper nibble: 0-15 */
-            
-            /* Apply scale and subtract min */
-            dst[b * 256 + i] = d * x0 - dm;
-            dst[b * 256 + i + 1] = d * x1 - dm;
+        float d = f16_to_f32(blocks[b].d);
+        float dmin = f16_to_f32(blocks[b].dmin);
+        const uint8_t* sc = blocks[b].scales;
+
+        /* Unpack 6-bit scales and mins from 12 bytes */
+        uint8_t scales[8], mins[8];
+        for (int i = 0; i < 4; i++) {
+            scales[2*i]   = sc[i] & 63;
+            scales[2*i+1] = sc[i+4] & 63;
+            mins[2*i]     = sc[i] >> 6 | ((sc[i+8] & 0x0F) << 2);
+            mins[2*i+1]   = sc[i+4] >> 6 | ((sc[i+8] >> 4) << 2);
+        }
+
+        /* Dequantize 8 sub-blocks of 32 weights */
+        for (int j = 0; j < 8; j++) {
+            float sc_val = d * scales[j];
+            float mn_val = dmin * mins[j];
+            for (int k = 0; k < 16; k++) {
+                uint8_t q = blocks[b].qs[j*16 + k];
+                dst[b*256 + j*32 + k]      = sc_val * (q & 0xF) - mn_val;
+                dst[b*256 + j*32 + k + 16] = sc_val * (q >> 4) - mn_val;
+            }
+        }
+    }
+}
+
+/*
+ * Dequantize Q5_K to float
+ * 256 weights per super-block, 5-bit quantization
+ */
+static void dequantize_q5_K(const void* src, float* dst, int n) {
+    const block_q5_K* blocks = (const block_q5_K*)src;
+    int num_blocks = n / 256;
+
+    for (int b = 0; b < num_blocks; b++) {
+        float d = f16_to_f32(blocks[b].d);
+        float dmin = f16_to_f32(blocks[b].dmin);
+        const uint8_t* sc = blocks[b].scales;
+
+        /* Unpack 6-bit scales and mins (same as Q4_K) */
+        uint8_t scales[8], mins[8];
+        for (int i = 0; i < 4; i++) {
+            scales[2*i]   = sc[i] & 63;
+            scales[2*i+1] = sc[i+4] & 63;
+            mins[2*i]     = sc[i] >> 6 | ((sc[i+8] & 0x0F) << 2);
+            mins[2*i+1]   = sc[i+4] >> 6 | ((sc[i+8] >> 4) << 2);
+        }
+
+        /* Dequantize: low 4 bits from qs, high bit from qh */
+        for (int j = 0; j < 8; j++) {
+            float sc_val = d * scales[j];
+            float mn_val = dmin * mins[j];
+            for (int k = 0; k < 16; k++) {
+                uint8_t q = blocks[b].qs[j*16 + k];
+                int idx0 = j*32 + k;
+                int idx1 = j*32 + k + 16;
+                /* Get high bits from qh */
+                int h0 = (blocks[b].qh[idx0 / 8] >> (idx0 % 8)) & 1;
+                int h1 = (blocks[b].qh[idx1 / 8] >> (idx1 % 8)) & 1;
+                dst[b*256 + idx0] = sc_val * ((q & 0xF) | (h0 << 4)) - mn_val;
+                dst[b*256 + idx1] = sc_val * ((q >> 4) | (h1 << 4)) - mn_val;
+            }
+        }
+    }
+}
+
+/*
+ * Dequantize Q6_K to float
+ * 256 weights per super-block, 6-bit quantization
+ */
+static void dequantize_q6_K(const void* src, float* dst, int n) {
+    const block_q6_K* blocks = (const block_q6_K*)src;
+    int num_blocks = n / 256;
+
+    for (int b = 0; b < num_blocks; b++) {
+        float d = f16_to_f32(blocks[b].d);
+
+        /* 16 sub-blocks of 16 weights, each with an 8-bit scale */
+        for (int j = 0; j < 16; j++) {
+            float sc = d * blocks[b].scales[j];
+            for (int k = 0; k < 16; k++) {
+                int idx = j*16 + k;
+                /* Lower 4 bits from ql */
+                int ql = blocks[b].ql[idx / 2];
+                int q4 = (idx % 2 == 0) ? (ql & 0xF) : (ql >> 4);
+                /* Upper 2 bits from qh */
+                int qh = blocks[b].qh[idx / 4];
+                int q2 = (qh >> (2 * (idx % 4))) & 3;
+                /* Combine to 6-bit value, centered at 32 */
+                int q = q4 | (q2 << 4);
+                dst[b*256 + idx] = sc * (q - 32);
+            }
         }
     }
 }
@@ -216,6 +306,9 @@ static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
     /* Extract layer number FIRST */
     const char* blk = strstr(name, "blk.");
     if (blk) *layer = atoi(blk + 4);
+
+    /* Skip bias tensors — we only handle weights */
+    if (strstr(name, ".bias")) return;
 
     /* Token embeddings */
     if (strstr(name, "token_embd") || strstr(name, "tok_embeddings")) {
@@ -458,9 +551,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         parse_tensor_name(tensors[i].name, &layer_idx, &proj_type);
         
         /* Debug: print first few tensor names */
-        if (i < 5) {
-            printf("  Tensor %d: %s -> layer=%d proj=%d\n", 
-                   (int)i, tensors[i].name, layer_idx, proj_type);
+        if (i < 10) {
+            printf("  Tensor %d: %s -> layer=%d proj=%d type=%d dims=%llux%llu size=%llu\n", 
+                   (int)i, tensors[i].name, layer_idx, proj_type, tensors[i].type,
+                   (unsigned long long)tensors[i].dims[0], 
+                   (unsigned long long)(tensors[i].n_dims > 1 ? tensors[i].dims[1] : 1),
+                   (unsigned long long)tensors[i].size);
         }
         
         /* Get dimensions */
@@ -470,7 +566,9 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         /* Dequantize and store based on type */
         if (tensors[i].type == GGML_TYPE_Q4_0 || 
             tensors[i].type == GGML_TYPE_Q4_K ||
-            tensors[i].type == GGML_TYPE_Q4_1) {
+            tensors[i].type == GGML_TYPE_Q4_1 ||
+            tensors[i].type == GGML_TYPE_Q5_K ||
+            tensors[i].type == GGML_TYPE_Q6_K) {
             
             int num_elements = rows * cols;
             float* f32_data = aligned_malloc(num_elements * sizeof(float), 64);
@@ -479,6 +577,10 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 dequantize_q4_0(tensor_data, f32_data, num_elements);
             } else if (tensors[i].type == GGML_TYPE_Q4_K) {
                 dequantize_q4_K(tensor_data, f32_data, num_elements);
+            } else if (tensors[i].type == GGML_TYPE_Q5_K) {
+                dequantize_q5_K(tensor_data, f32_data, num_elements);
+            } else if (tensors[i].type == GGML_TYPE_Q6_K) {
+                dequantize_q6_K(tensor_data, f32_data, num_elements);
             }
             
             /* Convert to dequantized tensor format */
@@ -578,6 +680,10 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 loaded_tensors++;
             } else if (proj_type == PROJ_EMBED) {
                 /* Copy to token embeddings */
+                printf("  [Embed: rows=%d cols=%d, vocab=%d hidden=%d]\n", rows, cols, config.vocab_size, config.hidden_size);
+                /* Check if dequantized data has non-zero values */
+                float sample = dt->weights[0] * dt->scales[0];
+                printf("  [Embed sample: w[0]=%d s[0]=%.6f val=%.6f]\n", dt->weights[0], dt->scales[0], sample);
                 for (int r = 0; r < rows && r < config.vocab_size; r++) {
                     for (int c = 0; c < cols && c < config.hidden_size; c++) {
                         model->token_embeddings[r * config.hidden_size + c] = 
