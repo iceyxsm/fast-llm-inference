@@ -70,7 +70,10 @@ $CC $CFLAGS -c src/kernels/matmul_avx2.c -o src/kernels/matmul_avx2.o
 $CC $CFLAGS -c src/kernels/activations_avx2.c -o src/kernels/activations_avx2.o
 
 echo "  Linking fllm..."
-CLI_SRCS="cli/cli_main.c cli/cli_ui.c cli/cli_specs.c cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c"
+OBJ="src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o"
+OBJ="$OBJ src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o"
+OBJ="$OBJ src/kernels/matmul_avx2.o src/kernels/activations_avx2.o"
+CLI_SRCS="cli/cli_main.c cli/cli_ui.c cli/cli_specs.c cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c cli/cli_chat.c"
 
 $CC $CFLAGS -Icli -o "fllm${EXE}" $CLI_SRCS $OBJ -fopenmp $LDEXTRA
 
@@ -109,8 +112,8 @@ echo ""
 echo -e "  ${GREEN}Done! Type 'fllm' to start.${RESET}"
 echo ""
 echo "  Quick reference:"
-echo "    fllm          Start (downloads model on first run)"
+echo "    fllm          Start interactive CLI"
 echo "    fllm -off     Stop background daemon"
-echo "    fllm --bench  Synthetic benchmark"
+echo "    fllm --status Check daemon status"
 echo "    fllm -h       Help"
 echo ""

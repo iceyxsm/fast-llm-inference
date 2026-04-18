@@ -331,7 +331,17 @@ static int parse_repo(const char* repo_id, model_entry_t* e) {
 /* ── Dedup ────────────────────────────────────────────────────────── */
 
 static int already_have(const model_entry_t* list, int count, const char* full_name) {
-    for (int i=0;i<count;i++) if (strcmp(list[i].full_name, full_name)==0) return 1;
+    for (int i=0;i<count;i++) {
+        if (strcmp(list[i].full_name, full_name)==0) return 1;
+        if (strcmp(list[i].filename, full_name)==0) return 1;
+    }
+    return 0;
+}
+
+/* Also check by filename */
+static int already_have_file(const model_entry_t* list, int count, const char* filename) {
+    for (int i=0;i<count;i++)
+        if (strcmp(list[i].filename, filename)==0) return 1;
     return 0;
 }
 
@@ -366,6 +376,7 @@ int catalog_fetch(model_entry_t* out, int max, model_type_t type) {
             if (!parse_repo(repo, &tmp)) continue;
             if (tmp.params_b < 0.1 && type != MTYPE_VOICE && type != MTYPE_STT) continue;
             if (already_have(out, count, tmp.full_name)) continue;
+            if (already_have_file(out, count, tmp.filename)) continue;
 
             tmp.type = type; /* override with what we searched for */
             out[count++] = tmp;
@@ -454,7 +465,7 @@ static int build_filters(const hw_specs_t* sp, param_filter_t* f, int max) {
 
 /* ── Browse with table ────────────────────────────────────────────── */
 
-void catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* specs, model_type_t type) {
+int catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* specs, model_type_t type, int start_page) {
     double fmin=0, fmax=999;
 
     if (type == MTYPE_LLM || type == MTYPE_VISION || type == MTYPE_CODE) {
@@ -472,9 +483,9 @@ void catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* s
         }
         printf("\n  > "); fflush(stdout);
         char buf[16]={0};
-        if (!fgets(buf,sizeof(buf),stdin)) return;
+        if (!fgets(buf,sizeof(buf),stdin)) return 0;
         int fc=atoi(buf);
-        if (fc<1||fc>nf) return;
+        if (fc<1||fc>nf) return 0;
         fmin=filters[fc-1].min_b; fmax=filters[fc-1].max_b;
 
         /* Clear the size menu, replace with the table */
@@ -489,12 +500,14 @@ void catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* s
         else if (entries[i].params_b<0.1 && (type==MTYPE_VOICE||type==MTYPE_STT)) idx[fcount++]=i;
     }
 
-    if (fcount==0) { printf("\n  No models found in this range.\n\n"); return; }
+    if (fcount==0) { printf("\n  No models found in this range.\n\n"); return 0; }
 
     /* Paginated display — 10 per page */
-    int page = 0;
+    int page = start_page;
     int per_page = 10;
     int total_pages = (fcount + per_page - 1) / per_page;
+    if (page >= total_pages) page = total_pages - 1;
+    if (page < 0) page = 0;
 
     /* Store filtered indices globally so browse_flow can use them */
     /* (catalog_browse is called for display, browse_flow handles actions) */
@@ -561,35 +574,60 @@ void catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* s
         }
         printf("\n");
 
-        /* Page navigation */
-        if (total_pages > 1) {
-            printf("  ");
-            if (page > 0) { cli_cprint("[P]", CLR_CYAN); printf(" Prev  "); }
-            if (page < total_pages - 1) { cli_cprint("[N]", CLR_CYAN); printf(" Next  "); }
-            cli_cprint("[M]", CLR_RED); printf(" Main Menu");
-            printf("\n");
-        } else {
-            printf("  ");
-            cli_cprint("[M]", CLR_RED); printf(" Main Menu\n");
-        }
+        /* All actions in one prompt */
+        printf("  Download: enter numbers (e.g. 1,3,5)\n");
+        printf("  ");
+        if (total_pages > 1 && page > 0) { cli_cprint("[P]", CLR_CYAN); printf(" Prev  "); }
+        if (total_pages > 1 && page < total_pages - 1) { cli_cprint("[N]", CLR_CYAN); printf(" Next  "); }
+        cli_cprint("[L]", CLR_CYAN); printf(" Load more  ");
+        cli_cprint("[U]", CLR_CYAN); printf(" Custom URL  ");
+        cli_cprint("[M]", CLR_RED); printf(" Main menu");
+        printf("\n");
 
-        /* Wait for page nav or exit */
-        printf("  > ");
+        printf("\n  > ");
         fflush(stdout);
-        char nav[16]={0};
-        if (!fgets(nav, sizeof(nav), stdin)) return;
+        char nav[256]={0};
+        if (!fgets(nav, sizeof(nav), stdin)) return 0;
         nav[strcspn(nav, "\n")] = '\0';
 
         if (nav[0]=='n'||nav[0]=='N') {
             if (page < total_pages - 1) { page++; cli_clear(); continue; }
+            else continue;
         } else if (nav[0]=='p'||nav[0]=='P') {
             if (page > 0) { page--; cli_clear(); continue; }
+            else continue;
         } else if (nav[0]=='m'||nav[0]=='M') {
-            return; /* back to main menu */
+            return 0;
+        } else if (nav[0]=='l'||nav[0]=='L') {
+            return 'L';
+        } else if (nav[0]=='u'||nav[0]=='U') {
+            return 'U';
+        } else if (nav[0] >= '1' && nav[0] <= '9') {
+            /* Download — parse comma-separated numbers */
+            char* tok = strtok(nav, ", ");
+            while (tok) {
+                int choice = atoi(tok);
+                if (choice >= 1 && choice <= fcount) {
+                    const model_entry_t* dm = &entries[idx[choice-1]];
+                    if (!model_is_local(dm)) {
+                        /* Inline download — need non-const cast for download_model */
+                        download_model(dm);
+                    } else {
+                        printf("  %s already downloaded.\n", dm->short_name);
+                    }
+                }
+                tok = strtok(NULL, ", ");
+            }
+            printf("\n  Press Enter to continue...");
+            fflush(stdout);
+            { char _b[4]; fgets(_b, sizeof(_b), stdin); }
+            cli_clear();
+            continue;
         } else {
-            break; /* exit pagination, let browse_flow handle input */
+            continue;
         }
     }
+    return 0;
 }
 
 /* ── Filter helper (for browse_flow to get indices) ───────────────── */

@@ -51,7 +51,7 @@ CLI_DEPS = src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kern
 CLI_FLAGS = -O3 -mavx2 -mfma -fopenmp -ffast-math -Iinclude -Icli
 
 # fllm modular CLI sources
-CLI_SRCS = cli/cli_main.c cli/cli_ui.c cli/cli_specs.c cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c
+CLI_SRCS = cli/cli_main.c cli/cli_ui.c cli/cli_specs.c cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c cli/cli_chat.c
 
 cli_runner: cli_runner.c $(CLI_DEPS)
 	$(CC) $(CLI_FLAGS) -o cli_runner$(EXE) cli_runner.c $(CLI_DEPS) $(LDFLAGS) $(LDFLAGS_EXTRA)

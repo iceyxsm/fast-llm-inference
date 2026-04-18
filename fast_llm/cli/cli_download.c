@@ -3,18 +3,19 @@
  */
 #include "cli.h"
 
-/* ── Download a file via curl/wget ────────────────────────────────── */
+/* ── Download a file via curl/wget — shows speed during download ───── */
 
 int download_file(const char* url, const char* dest) {
     char cmd[2048];
 
+    /* Use curl default progress (shows speed + ETA), fallback to wget */
 #ifdef _WIN32
     snprintf(cmd, sizeof(cmd),
-        "curl.exe -L --progress-bar -o \"%s\" \"%s\"", dest, url);
+        "curl.exe -L -# -o \"%s\" \"%s\"", dest, url);
 #else
     snprintf(cmd, sizeof(cmd),
-        "curl -L --progress-bar -o '%s' '%s' 2>&1 || "
-        "wget --show-progress -O '%s' '%s' 2>&1",
+        "curl -L -# -o '%s' '%s' || "
+        "wget --show-progress -O '%s' '%s'",
         dest, url, dest, url);
 #endif
 
@@ -22,7 +23,18 @@ int download_file(const char* url, const char* dest) {
     return (ret == 0 && cli_file_exists(dest));
 }
 
-/* ── Download a catalog model ─────────────────────────────────────── */
+/* ── Get file size in bytes ───────────────────────────────────────── */
+
+static long get_file_size(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    return sz;
+}
+
+/* ── Download a catalog model — shows speed + final size ──────────── */
 
 int download_model(const model_entry_t* m) {
     char mdir[512], dest[512], size_str[32];
@@ -40,8 +52,11 @@ int download_model(const model_entry_t* m) {
     printf("\n");
     cli_cprint("  Downloading: ", CLR_CYAN);
     printf("%s\n", m->short_name);
-    printf("  Size: %s\n", size_str);
-    printf("  To:   %s\n\n", dest);
+    printf("  Expected size: %s\n", size_str);
+    printf("  Saving to: %s\n\n", dest);
+    fflush(stdout);
+
+    double start = cli_time_sec();
 
     if (!download_file(m->url, dest)) {
         cli_cprint("  Download failed!\n", CLR_RED);
@@ -50,8 +65,29 @@ int download_model(const model_entry_t* m) {
         return 0;
     }
 
-    printf("\n  ");
-    cli_cprint("Download complete!\n\n", CLR_GREEN);
+    double elapsed = cli_time_sec() - start;
+    long file_bytes = get_file_size(dest);
+    double file_mb = file_bytes / (1024.0 * 1024.0);
+    double speed_mbps = (elapsed > 0.1) ? file_mb / elapsed : 0;
+
+    printf("\n");
+    cli_cprint("  Download complete!\n", CLR_GREEN);
+    printf("  File size: ");
+    if (file_mb >= 1024.0)
+        printf("%.2f GB", file_mb / 1024.0);
+    else
+        printf("%.1f MB", file_mb);
+
+    if (speed_mbps > 0) {
+        printf("  |  Time: %.0fs  |  Avg speed: ", elapsed);
+        if (speed_mbps >= 1.0)
+            printf("%.1f MB/s", speed_mbps);
+        else
+            printf("%.0f KB/s", speed_mbps * 1024.0);
+    }
+    printf("\n\n");
+    fflush(stdout);
+
     return 1;
 }
 

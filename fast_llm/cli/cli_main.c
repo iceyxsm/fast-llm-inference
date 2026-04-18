@@ -16,38 +16,44 @@ static int g_catalog_count = 0;
 
 /* ── Main menu ────────────────────────────────────────────────────── */
 
-static void show_menu(const hw_specs_t* specs) {
+static void show_menu(const hw_specs_t* specs, int animate) {
     cli_separator();
     cli_cprint("  MAIN MENU\n", CLR_CYAN);
     cli_separator();
-    fflush(stdout); cli_delay(100);
+    if (animate) { fflush(stdout); cli_delay(100); }
     printf("\n");
 
     printf("  ");
     cli_cprint("[1]", CLR_GREEN);
-    printf(" Check Specs       Detect your hardware");
-    if (specs->valid) { printf("  ("); cli_stars(specs->stars); printf(")"); }
-    printf("\n"); fflush(stdout); cli_delay(60);
+    printf(" Quick Start       Chat with default model\n");
+    if (animate) { fflush(stdout); cli_delay(60); }
 
     printf("  ");
     cli_cprint("[2]", CLR_GREEN);
-    printf(" Browse Models     Fetch & browse available models\n");
-    fflush(stdout); cli_delay(60);
+    printf(" Check Specs       Detect your hardware");
+    if (specs->valid) { printf("  ("); cli_stars(specs->stars); printf(")"); }
+    printf("\n");
+    if (animate) { fflush(stdout); cli_delay(60); }
 
     printf("  ");
     cli_cprint("[3]", CLR_GREEN);
-    printf(" My Models         View downloaded models\n");
-    fflush(stdout); cli_delay(60);
+    printf(" Browse Models     Fetch & browse available models\n");
+    if (animate) { fflush(stdout); cli_delay(60); }
 
     printf("  ");
     cli_cprint("[4]", CLR_GREEN);
-    printf(" Run Model         Load a model & start inference\n");
-    fflush(stdout); cli_delay(60);
+    printf(" My Models         View downloaded models\n");
+    if (animate) { fflush(stdout); cli_delay(60); }
 
     printf("  ");
     cli_cprint("[5]", CLR_GREEN);
+    printf(" Chat               Start chatting with a model\n");
+    if (animate) { fflush(stdout); cli_delay(60); }
+
+    printf("  ");
+    cli_cprint("[6]", CLR_GREEN);
     printf(" Daemon Status     Check / stop background server\n");
-    fflush(stdout); cli_delay(60);
+    if (animate) { fflush(stdout); cli_delay(60); }
 
     printf("\n");
     printf("  ");
@@ -162,62 +168,236 @@ static void status_flow(void) {
 
 /* ── My Models: show all downloaded models ─────────────────────────── */
 
+/* ── Helper: extract info from a gguf filename ────────────────────── */
+
+static void parse_model_filename(const char* fname, char* name, int nsz,
+                                  char* params, int psz, char* quant, int qsz) {
+    char tmp[256];
+    strncpy(tmp, fname, sizeof(tmp)-1); tmp[sizeof(tmp)-1]='\0';
+
+    /* Remove .gguf extension */
+    char* ext = strstr(tmp, ".gguf");
+    if (ext) *ext = '\0';
+
+    /* Extract quant */
+    quant[0] = '\0';
+    const char* qpats[] = {"Q4_K_M","Q4_K_S","Q4_0","Q4_1","Q5_K_M","Q5_K_S","Q3_K_M","Q3_K_L","Q6_K","Q8_0","f16","f32",NULL};
+    for (int i=0; qpats[i]; i++) {
+        char* q = strstr(tmp, qpats[i]);
+        if (q) {
+            strncpy(quant, qpats[i], qsz-1);
+            /* Remove quant from name */
+            if (q > tmp && (*(q-1)=='-'||*(q-1)=='_'||*(q-1)=='.')) q--;
+            *q = '\0';
+            break;
+        }
+    }
+
+    /* Extract params (e.g. "7B", "1.1B") */
+    params[0] = '\0';
+    char* p = tmp;
+    while (*p) {
+        if ((*p>='0'&&*p<='9')||*p=='.') {
+            char* start = p;
+            while (*p && ((*p>='0'&&*p<='9')||*p=='.')) p++;
+            if (*p=='B'||*p=='b') {
+                int len = (int)(p - start + 1);
+                if (len < psz) { memcpy(params, start, len); params[len]='\0'; }
+                /* Remove from name */
+                char* rm = start;
+                if (rm > tmp && (*(rm-1)=='-'||*(rm-1)=='_')) rm--;
+                memmove(rm, p+1, strlen(p+1)+1);
+                p = rm;
+                break;
+            }
+        }
+        p++;
+    }
+
+    /* Clean name: replace - and _ with space, strip suffixes */
+    for (p=tmp; *p; p++) if (*p=='-'||*p=='_') *p=' ';
+    /* Remove common suffixes */
+    const char* suf[] = {"Instruct","instruct","Chat","chat","GGUF","gguf","it",NULL};
+    for (int i=0; suf[i]; i++) {
+        char* s = strstr(tmp, suf[i]);
+        if (s) {
+            if (s > tmp && *(s-1)==' ') s--;
+            *s = '\0';
+        }
+    }
+    /* Trim */
+    p = tmp; while (*p==' ') p++;
+    int len = (int)strlen(p);
+    while (len>0 && p[len-1]==' ') p[--len]='\0';
+
+    strncpy(name, p, nsz-1); name[nsz-1]='\0';
+}
+
+/* ── My Models: show downloaded models with info ──────────────────── */
+
 static void my_models_flow(void) {
     char locals[16][512];
     int nlocal = list_local_models(locals, 16);
 
-    cli_separator();
-    cli_cprint("  MY MODELS\n", CLR_CYAN);
-    cli_separator();
-    fflush(stdout); cli_delay(100);
-    printf("\n");
+    while (1) {
+        cli_clear();
+        cli_separator();
+        cli_cprint("  MY MODELS\n", CLR_CYAN);
+        cli_separator();
+        fflush(stdout); cli_delay(100);
+        printf("\n");
 
-    if (nlocal == 0) {
-        cli_cprint("  No models downloaded yet.\n", CLR_YELLOW);
-        printf("  Use 'Browse Models' to find and download models.\n\n");
-        return;
-    }
-
-    printf("  %-5s %-30s %s\n", "#", "Filename", "Size");
-    printf("  %-5s %-30s %s\n", "---", "------------------------------", "--------");
-    fflush(stdout); cli_delay(100);
-
-    for (int i = 0; i < nlocal; i++) {
-        const char* fname = strrchr(locals[i], PATH_SEP);
-        if (fname) fname++; else fname = locals[i];
-
-        /* Get file size */
-        FILE* f = fopen(locals[i], "rb");
-        double size_mb = 0;
-        if (f) {
-            fseek(f, 0, SEEK_END);
-            size_mb = ftell(f) / (1024.0 * 1024.0);
-            fclose(f);
+        if (nlocal == 0) {
+            cli_cprint("  No models downloaded yet.\n", CLR_YELLOW);
+            printf("  Use 'Browse Models' to find and download models.\n\n");
+            printf("  "); cli_cprint("[M]", CLR_RED); printf(" Main menu\n");
+            printf("\n  > "); fflush(stdout);
+            char b[16]; if (!fgets(b,sizeof(b),stdin)) return;
+            return;
         }
 
+        /* Table header */
+        printf("  %-5s %-20s %-7s %-7s %-7s %s\n",
+               "#", "Name", "Params", "Size", "Quant", "Filename");
+        printf("  %-5s %-20s %-7s %-7s %-7s %s\n",
+               "---", "--------------------", "------", "-------", "------", "----------------------------");
+        fflush(stdout); cli_delay(100);
+
+        for (int i = 0; i < nlocal; i++) {
+            const char* fpath = locals[i];
+            const char* fname = strrchr(fpath, PATH_SEP);
+            if (fname) fname++; else fname = fpath;
+
+            /* Get file size */
+            FILE* f = fopen(fpath, "rb");
+            double size_mb = 0;
+            if (f) { fseek(f, 0, SEEK_END); size_mb = ftell(f) / (1024.0*1024.0); fclose(f); }
+
+            /* Parse info from filename */
+            char mname[21], mparams[8], mquant[8];
+            parse_model_filename(fname, mname, sizeof(mname), mparams, sizeof(mparams), mquant, sizeof(mquant));
+
+            char c_size[8];
+            if (size_mb >= 1024) snprintf(c_size, sizeof(c_size), "%.1fGB", size_mb/1024.0);
+            else snprintf(c_size, sizeof(c_size), "%.0fMB", size_mb);
+
+            /* Truncate filename for display */
+            char fn_disp[29];
+            strncpy(fn_disp, fname, 28); fn_disp[28]='\0';
+
+            cli_color(CLR_GREEN);
+            printf("  [%2d] ", i+1);
+            cli_reset();
+            printf("%-20s %-7s %-7s %-7s %s\n",
+                   mname, mparams[0] ? mparams : "-", c_size,
+                   mquant[0] ? mquant : "-", fn_disp);
+            fflush(stdout); cli_delay(50);
+        }
+
+        printf("\n");
+        printf("  Enter number for details, ");
+        cli_cprint("[M]", CLR_RED);
+        printf(" Main menu\n");
+        printf("\n  > ");
+        fflush(stdout);
+
+        char buf[16]={0};
+        if (!fgets(buf, sizeof(buf), stdin)) return;
+        buf[strcspn(buf, "\n")] = '\0';
+
+        if (buf[0]=='m'||buf[0]=='M'||buf[0]=='0'||buf[0]=='\0') return;
+
+        int choice = atoi(buf);
+        if (choice < 1 || choice > nlocal) continue;
+
+        /* Show model details */
+        const char* fpath = locals[choice-1];
+        const char* fname = strrchr(fpath, PATH_SEP);
+        if (fname) fname++; else fname = fpath;
+
+        FILE* f = fopen(fpath, "rb");
+        double size_mb = 0;
+        if (f) { fseek(f, 0, SEEK_END); size_mb = ftell(f) / (1024.0*1024.0); fclose(f); }
+
+        char mname[64], mparams[8], mquant[8];
+        parse_model_filename(fname, mname, sizeof(mname), mparams, sizeof(mparams), mquant, sizeof(mquant));
+
+        cli_clear();
+        cli_separator();
+        cli_cprint("  MODEL DETAILS\n", CLR_CYAN);
+        cli_separator();
+        fflush(stdout); cli_delay(150);
+
+        printf("\n");
+        printf("  Name:      "); cli_cprint(mname, CLR_GREEN); printf("\n");
+        fflush(stdout); cli_delay(80);
+        printf("  Filename:  %s\n", fname);
+        fflush(stdout); cli_delay(80);
+        if (mparams[0]) { printf("  Params:    %s\n", mparams); fflush(stdout); cli_delay(80); }
+        if (mquant[0])  { printf("  Quant:     %s\n", mquant); fflush(stdout); cli_delay(80); }
+
         char c_size[16];
-        if (size_mb >= 1024) snprintf(c_size, sizeof(c_size), "%.1f GB", size_mb / 1024.0);
-        else snprintf(c_size, sizeof(c_size), "%.0f MB", size_mb);
+        if (size_mb >= 1024) snprintf(c_size, sizeof(c_size), "%.2f GB", size_mb/1024.0);
+        else snprintf(c_size, sizeof(c_size), "%.1f MB", size_mb);
+        printf("  Size:      %s\n", c_size);
+        fflush(stdout); cli_delay(80);
 
-        printf("  ");
-        cli_color(CLR_GREEN);
-        printf("[%2d]", i + 1);
-        cli_reset();
+        printf("  Path:      %s\n", fpath);
+        fflush(stdout); cli_delay(80);
 
-        /* Truncate filename to 30 chars */
-        char disp[31];
-        strncpy(disp, fname, 30); disp[30] = '\0';
-        printf(" %-30s %s\n", disp, c_size);
-        fflush(stdout); cli_delay(70);
+        /* Check if we have catalog info for this model */
+        int found_in_catalog = 0;
+        for (int i = 0; i < g_catalog_count; i++) {
+            if (strcmp(g_catalog[i].filename, fname) == 0) {
+                const model_entry_t* m = &g_catalog[i];
+                found_in_catalog = 1;
+                printf("\n");
+                cli_cprint("  Catalog Info\n", CLR_CYAN);
+                fflush(stdout); cli_delay(80);
+                printf("  Family:    %s\n", m->family);
+                fflush(stdout); cli_delay(60);
+                printf("  Type:      %s\n", catalog_type_name(m->type));
+                fflush(stdout); cli_delay(60);
+                if (m->context_len > 0) {
+                    if (m->context_len >= 131072) printf("  Context:   128K\n");
+                    else if (m->context_len >= 32768) printf("  Context:   32K\n");
+                    else if (m->context_len >= 8192) printf("  Context:   8K\n");
+                    else printf("  Context:   %dK\n", m->context_len/1024);
+                    fflush(stdout); cli_delay(60);
+                }
+                printf("  Tools:     %s\n", m->has_tools ? "Yes" : "No");
+                fflush(stdout); cli_delay(60);
+                printf("  Vision:    %s\n", m->has_vision ? "Yes" : "No");
+                fflush(stdout); cli_delay(60);
+                printf("  Code:      %s\n", m->has_code ? "Yes" : "No");
+                fflush(stdout); cli_delay(60);
+                if (m->license[0]) { printf("  License:   %s\n", m->license); fflush(stdout); cli_delay(60); }
+                if (m->downloads > 0) { printf("  Downloads: %d\n", m->downloads); fflush(stdout); cli_delay(60); }
+                printf("  Source:    %s\n", m->id);
+                fflush(stdout); cli_delay(60);
+                break;
+            }
+        }
+
+        if (!found_in_catalog) {
+            printf("\n  ");
+            cli_cprint("(No catalog info — downloaded via custom URL or not in cache)\n", CLR_YELLOW);
+        }
+
+        printf("\n");
+        printf("  Press Enter to go back...");
+        fflush(stdout);
+        { char _b[4]; fgets(_b, sizeof(_b), stdin); }
     }
-    printf("\n");
 }
 
 /* ── Custom URL download ──────────────────────────────────────────── */
 
 static void custom_url_flow(void) {
     printf("\n");
+    cli_separator();
     cli_cprint("  CUSTOM MODEL DOWNLOAD\n", CLR_CYAN);
+    cli_separator();
     printf("\n  Paste a direct URL to a .gguf file:\n");
     printf("  > ");
     fflush(stdout);
@@ -234,8 +414,8 @@ static void custom_url_flow(void) {
     /* Check it ends with .gguf */
     if (!strstr(fname, ".gguf")) {
         cli_cprint("  Warning: ", CLR_YELLOW);
-        printf("URL doesn't end with .gguf. Continue? ");
-        if (!cli_prompt_yn("Download anyway?")) return;
+        printf("URL doesn't appear to be a .gguf file.\n");
+        if (!cli_prompt_yn("Continue anyway?")) return;
     }
 
     char mdir[512], dest[512];
@@ -250,9 +430,65 @@ static void custom_url_flow(void) {
         return;
     }
 
-    printf("\n  Downloading: %s\n", fname);
-    printf("  To: %s\n\n", dest);
+    /* Show model info extracted from filename */
+    printf("\n");
+    cli_separator();
+    cli_cprint("  MODEL INFO\n", CLR_CYAN);
+    cli_separator();
+    fflush(stdout); cli_delay(100);
 
+    printf("\n");
+    printf("  File:    %s\n", fname); fflush(stdout); cli_delay(60);
+    printf("  Source:  %s\n", url); fflush(stdout); cli_delay(60);
+
+    /* Try to extract info from filename */
+    char tmp_name[128];
+    strncpy(tmp_name, fname, sizeof(tmp_name)-1); tmp_name[sizeof(tmp_name)-1]='\0';
+
+    /* Guess params from filename */
+    double params = 0;
+    const char* p = tmp_name;
+    while (*p) {
+        if ((*p>='0'&&*p<='9')||*p=='.') {
+            double v = atof(p);
+            while (*p&&((*p>='0'&&*p<='9')||*p=='.')) p++;
+            if (*p=='B'||*p=='b') { params = v; break; }
+        }
+        p++;
+    }
+    if (params > 0) {
+        printf("  Params:  %.1fB\n", params); fflush(stdout); cli_delay(60);
+    }
+
+    /* Guess quant */
+    char quant[16] = {0};
+    const char* qpats[] = {"Q4_K_M","Q4_K_S","Q4_0","Q5_K_M","Q3_K_M","Q6_K","Q8_0","f16",NULL};
+    for (int i=0;qpats[i];i++) {
+        if (strstr(fname, qpats[i])) { strncpy(quant, qpats[i], sizeof(quant)-1); break; }
+    }
+    if (quant[0]) {
+        printf("  Quant:   %s\n", quant); fflush(stdout); cli_delay(60);
+    }
+
+    printf("  Save to: %s\n", dest); fflush(stdout); cli_delay(60);
+
+    printf("\n");
+    printf("  ");
+    cli_cprint("[D]", CLR_GREEN);
+    printf(" Download  ");
+    cli_cprint("[M]", CLR_RED);
+    printf(" Cancel\n");
+    printf("\n  > ");
+    fflush(stdout);
+
+    char confirm[16] = {0};
+    if (!fgets(confirm, sizeof(confirm), stdin)) return;
+    if (confirm[0] != 'd' && confirm[0] != 'D') {
+        printf("  Cancelled.\n\n");
+        return;
+    }
+
+    printf("\n");
     if (download_file(url, dest)) {
         cli_cprint("  Download complete!\n\n", CLR_GREEN);
     } else {
@@ -314,10 +550,11 @@ static void browse_flow(hw_specs_t* specs) {
             default: continue;
         }
 
-        /* Load or fetch catalog */
+        /* Load cache if empty */
         if (g_catalog_count == 0)
             g_catalog_count = catalog_load_cache(g_catalog, MAX_CATALOG);
 
+        /* Check if we have this type — if not, fetch inline */
         int have_type = 0;
         for (int i = 0; i < g_catalog_count; i++)
             if (g_catalog[i].type == type) { have_type = 1; break; }
@@ -329,85 +566,52 @@ static void browse_flow(hw_specs_t* specs) {
             for (int i = 0; i < nc && g_catalog_count < MAX_CATALOG; i++)
                 g_catalog[g_catalog_count++] = tmp[i];
             if (g_catalog_count > 0) catalog_save_cache(g_catalog, g_catalog_count);
+
+            /* Re-check — if still nothing, skip */
+            have_type = 0;
+            for (int i = 0; i < g_catalog_count; i++)
+                if (g_catalog[i].type == type) { have_type = 1; break; }
+            if (!have_type) {
+                printf("  No models found for this type.\n");
+                printf("  Press Enter to continue...");
+                fflush(stdout);
+                { char _b[4]; fgets(_b, sizeof(_b), stdin); }
+                continue;
+            }
         }
 
-        /* Clear and show size filter + table on same screen */
-        cli_clear();
-        catalog_browse(g_catalog, g_catalog_count, specs, type);
-
-        /* Action options after table */
-        printf("  Enter numbers to download (e.g. 1,3,5)\n");
-        printf("  ");
-        cli_cprint("[L]", CLR_CYAN);
-        printf(" Load more  ");
-        cli_cprint("[U]", CLR_CYAN);
-        printf(" Custom URL  ");
-        cli_cprint("[M]", CLR_RED);
-        printf(" Main menu\n");
-        printf("\n  > ");
-        fflush(stdout);
-        char dbuf[256]={0};
-        if (!fgets(dbuf, sizeof(dbuf), stdin)) return;
-        dbuf[strcspn(dbuf, "\n")] = '\0';
-        if (dbuf[0]=='m'||dbuf[0]=='M'||dbuf[0]=='0') continue; /* back to type selector → main menu */
-
-        /* Load more — re-fetch from API */
-        if (dbuf[0]=='l'||dbuf[0]=='L') {
+        /* Show catalog — size filter + paginated table */
+        int cur_page = 0;
+        while (1) {
             cli_clear();
-            model_entry_t tmp[MAX_CATALOG];
-            int nc = catalog_fetch(tmp, MAX_CATALOG, type);
-            for (int i = 0; i < nc && g_catalog_count < MAX_CATALOG; i++) {
-                /* Only add if not already present */
-                int dup = 0;
-                for (int j = 0; j < g_catalog_count; j++)
-                    if (strcmp(g_catalog[j].full_name, tmp[i].full_name)==0) { dup=1; break; }
-                if (!dup) g_catalog[g_catalog_count++] = tmp[i];
-            }
-            if (g_catalog_count > 0) catalog_save_cache(g_catalog, g_catalog_count);
-            continue;
-        }
+            int action = catalog_browse(g_catalog, g_catalog_count, specs, type, cur_page);
 
-        /* Custom URL */
-        if (dbuf[0]=='u'||dbuf[0]=='U') {
-            custom_url_flow();
-            printf("  Press Enter to continue...");
-            fflush(stdout);
-            { char _b[4]; fgets(_b, sizeof(_b), stdin); }
-            continue;
-        }
-
-        /* Build filtered index */
-        int idx[MAX_CATALOG]; int fcount=0;
-        for (int i=0;i<g_catalog_count;i++)
-            if (g_catalog[i].type == type) idx[fcount++]=i;
-
-        /* Parse comma-separated */
-        char* tok = strtok(dbuf, ", ");
-        while (tok) {
-            int choice = atoi(tok);
-            if (choice >= 1 && choice <= fcount) {
-                model_entry_t* m = &g_catalog[idx[choice-1]];
-                char mdir[512], dest[512];
-                cli_get_models_dir(mdir, sizeof(mdir));
-                snprintf(dest, sizeof(dest), "%s%c%s", mdir, PATH_SEP, m->filename);
-
-                if (cli_file_exists(dest)) {
-                    printf("\n  "); cli_cprint(m->short_name, CLR_GREEN);
-                    printf(" already downloaded.\n");
-                } else {
-                    if (specs && specs->valid && specs->tier < m->min_tier) {
-                        printf("\n  "); cli_cprint("Note: ", CLR_YELLOW);
-                        printf("%s needs %s tier.\n", m->short_name, cli_tier_name(m->min_tier));
-                    }
-                    download_model(m);
+            if (action == 'L') {
+                /* Load more from API — stay in same type, jump to last page */
+                cli_clear();
+                int old_count = g_catalog_count;
+                model_entry_t tmp[MAX_CATALOG];
+                int nc = catalog_fetch(tmp, MAX_CATALOG, type);
+                for (int i = 0; i < nc && g_catalog_count < MAX_CATALOG; i++) {
+                    int dup = 0;
+                    for (int j = 0; j < old_count; j++)
+                        if (strcmp(g_catalog[j].full_name, tmp[i].full_name)==0) { dup=1; break; }
+                    if (!dup) g_catalog[g_catalog_count++] = tmp[i];
                 }
+                if (g_catalog_count > 0) catalog_save_cache(g_catalog, g_catalog_count);
+                /* Jump to last page to show new models */
+                cur_page = 999; /* catalog_browse will clamp to last page */
+                continue;
+            } else if (action == 'U') {
+                custom_url_flow();
+                printf("  Press Enter to continue...");
+                fflush(stdout);
+                { char _b[4]; fgets(_b, sizeof(_b), stdin); }
+                continue;
+            } else {
+                break;
             }
-            tok = strtok(NULL, ", ");
         }
-
-        printf("\n  Press Enter to continue...");
-        fflush(stdout);
-        { char _b[4]; fgets(_b, sizeof(_b), stdin); }
     }
 }
 
@@ -465,13 +669,19 @@ int main(int argc, char* argv[]) {
     specs_load(&specs);
 
     /* Interactive menu loop */
+    int first_show = 1;
     while (1) {
         cli_clear();
-        show_menu(&specs);
-        int choice = cli_prompt_choice(5);
+        show_menu(&specs, first_show);
+        first_show = 0;
+        int choice = cli_prompt_choice(6);
 
         switch (choice) {
             case 1:
+                cli_clear();
+                chat_quick_start();
+                break;
+            case 2:
                 cli_clear();
                 specs_run_interactive();
                 specs_load(&specs);
@@ -479,22 +689,21 @@ int main(int argc, char* argv[]) {
                 fflush(stdout);
                 { char _b[4]; fgets(_b, sizeof(_b), stdin); }
                 break;
-            case 2:
+            case 3:
                 cli_clear();
                 browse_flow(&specs);
                 break;
-            case 3:
-                cli_clear();
-                my_models_flow();
-                printf("  Press Enter to continue...");
-                fflush(stdout);
-                { char _b[4]; fgets(_b, sizeof(_b), stdin); }
-                break;
             case 4:
                 cli_clear();
-                run_model_flow(NULL);
+                my_models_flow();
                 break;
-            case 5:
+            case 5: {
+                cli_clear();
+                chat_config_t cfg = chat_default_config();
+                chat_run(&cfg);
+                break;
+            }
+            case 6:
                 cli_clear();
                 status_flow();
                 printf("  Press Enter to continue...");

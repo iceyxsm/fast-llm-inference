@@ -14,9 +14,9 @@
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <windows.h>
   #include <psapi.h>
   #include <io.h>
   #include <process.h>
@@ -181,7 +181,8 @@ int    catalog_fetch(model_entry_t* out, int max, model_type_t type);
 int    catalog_load_cache(model_entry_t* out, int max);
 void   catalog_save_cache(const model_entry_t* entries, int count);
 int    catalog_refresh(model_entry_t* out, int max, model_type_t type);
-void catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* specs, model_type_t type);
+/* returns: 0=main menu, 'L'=load more, 'U'=custom url */
+int    catalog_browse(const model_entry_t* entries, int count, const hw_specs_t* specs, model_type_t type, int start_page);
 int  catalog_filter(const model_entry_t* entries, int count, model_type_t type,
                     double fmin, double fmax, int* idx_out, int max_idx);
 int    catalog_select_and_download(model_entry_t* entries, int count, const hw_specs_t* specs);
@@ -205,5 +206,29 @@ void   daemon_serve(const char* model_path);
 void   daemon_start_detached(const char* model_path);
 void   daemon_interactive(int port);
 void   daemon_stop(void);
+
+/* ── Chat (cli_chat.c) ───────────────────────────────────────────── */
+
+typedef struct {
+    char   model_path[512];
+    char   model_name[64];
+    int    max_tokens;
+    float  temperature;
+    float  top_p;
+    int    top_k;
+    int    context_window;
+    int    max_layers;
+    int    repeat_penalty_on;
+    float  repeat_penalty;
+} chat_config_t;
+
+chat_config_t chat_default_config(void);
+void   chat_configure(chat_config_t* cfg);
+void   chat_run(chat_config_t* cfg);
+void   chat_save_config(const chat_config_t* cfg);
+int    chat_load_config(const char* model_name, chat_config_t* cfg);
+void   chat_set_default_model(const char* model_path);
+int    chat_get_default_model(char* out, int sz);
+void   chat_quick_start(void);
 
 #endif /* CLI_H */

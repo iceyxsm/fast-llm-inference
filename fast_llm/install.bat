@@ -41,6 +41,7 @@ echo   Linking fllm.exe...
 gcc %CFLAGS% -Icli -o fllm.exe ^
     cli/cli_main.c cli/cli_ui.c cli/cli_specs.c ^
     cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c ^
+    cli/cli_chat.c ^
     src/inference.o src/gguf_loader.o src/kernels/cpu_features.o ^
     src/kernels/quant.o src/kernels/matmul_asm_style.o ^
     src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o ^
