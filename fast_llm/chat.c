@@ -11,10 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>
 #include <math.h>
+#include <ctype.h>
 
 #ifdef _WIN32
+#include <windows.h>
 #include <malloc.h>
 #define aligned_malloc(size, alignment) _aligned_malloc(size, alignment)
 #define aligned_free(ptr) _aligned_free(ptr)

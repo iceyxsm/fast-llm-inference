@@ -10,9 +10,11 @@ LDFLAGS = -lm -fopenmp
 ifeq ($(OS),Windows_NT)
     EXE = .exe
     RM = del /Q
+    LDFLAGS_EXTRA = -lws2_32 -lpsapi
 else
     EXE =
     RM = rm -f
+    LDFLAGS_EXTRA =
 endif
 
 # Core source files - only working kernels
@@ -44,10 +46,21 @@ $(TARGET): $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# CLI tools
-cli_runner: cli_runner.c src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/activations_avx2.o
-	$(CC) -O3 -mavx2 -mfma -fopenmp -ffast-math -Iinclude -o cli_runner$(EXE) cli_runner.c src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/activations_avx2.o $(LDFLAGS)
+# CLI tools - shared deps
+CLI_DEPS = src/inference.o src/gguf_loader.o src/kernels/cpu_features.o src/kernels/quant.o src/kernels/matmul_asm_style.o src/kernels/dequantized_tensor.o src/kernels/matmul_avx2.o src/kernels/activations_avx2.o
+CLI_FLAGS = -O3 -mavx2 -mfma -fopenmp -ffast-math -Iinclude -Icli
+
+# fllm modular CLI sources
+CLI_SRCS = cli/cli_main.c cli/cli_ui.c cli/cli_specs.c cli/cli_catalog.c cli/cli_download.c cli/cli_daemon.c
+
+cli_runner: cli_runner.c $(CLI_DEPS)
+	$(CC) $(CLI_FLAGS) -o cli_runner$(EXE) cli_runner.c $(CLI_DEPS) $(LDFLAGS) $(LDFLAGS_EXTRA)
 	@echo "Built: cli_runner$(EXE)"
+
+# fllm = modular CLI build
+fllm: $(CLI_SRCS) $(CLI_DEPS)
+	$(CC) $(CLI_FLAGS) -o fllm$(EXE) $(CLI_SRCS) $(CLI_DEPS) $(LDFLAGS) $(LDFLAGS_EXTRA)
+	@echo "Built: fllm$(EXE)"
 
 model_selector: model_selector.c
 	$(CC) -O3 -Iinclude -o model_selector$(EXE) model_selector.c $(LDFLAGS)
@@ -75,4 +88,4 @@ info:
 	@echo "CFLAGS: $(CFLAGS)"
 	@echo "Sources: $(SRCS)"
 
-.PHONY: all clean test info cli_runner model_selector chat
+.PHONY: all clean test info cli_runner fllm model_selector chat
