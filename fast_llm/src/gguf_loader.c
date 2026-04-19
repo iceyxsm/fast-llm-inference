@@ -317,8 +317,13 @@ static void parse_tensor_name(const char* name, int* layer, proj_type_t* proj) {
 
     /* LM head */
     if (strstr(name, "lm_head")) { *proj = PROJ_LM_HEAD; *layer = -1; return; }
-    if ((strstr(name, "output.weight") || strstr(name, "output_norm.weight")) && *layer < 0) {
+    if (strstr(name, "output.weight") && *layer < 0) {
         *proj = PROJ_LM_HEAD; return;
+    }
+
+    /* Final output norm (not in a block) */
+    if (strstr(name, "output_norm") && *layer < 0) {
+        *proj = PROJ_NORM; return;
     }
 
     /* Layer norms (only if inside a block) */
@@ -920,6 +925,11 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                     memcpy(model->post_attn_layernorm[layer_idx], tensor_data, rows * sizeof(float));
                     loaded_tensors++;
                 }
+            } else if (proj_type == PROJ_NORM && layer_idx < 0) {
+                /* Final output norm */
+                model->output_norm = aligned_malloc(rows * sizeof(float), 64);
+                memcpy(model->output_norm, tensor_data, rows * sizeof(float));
+                loaded_tensors++;
             }
         }
         
@@ -1112,6 +1122,7 @@ void model_free(transformer_model_t* model) {
     
     if (model->lm_head) dequantized_tensor_free(model->lm_head);
     if (model->token_embeddings) aligned_free(model->token_embeddings);
+    if (model->output_norm) aligned_free(model->output_norm);
     if (model->k_cache) aligned_free(model->k_cache);
     if (model->v_cache) aligned_free(model->v_cache);
 

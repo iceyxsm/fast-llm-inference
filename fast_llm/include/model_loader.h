@@ -61,6 +61,9 @@ typedef struct {
     
     /* LM head */
     dequantized_tensor_t* lm_head;
+
+    /* Final output norm */
+    float* output_norm;
     
     /* Optional: Speculative draft model */
     draft_model_t* draft_model;

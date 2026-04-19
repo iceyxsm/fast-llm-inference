@@ -271,10 +271,15 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
     
     memcpy(residual, hidden_states, seq_len * hidden_size * sizeof(float));
     
-    /* Pre-attention RMS norm */
+    /* Pre-attention RMS norm with learned weights */
     for (int s = 0; s < seq_len; s++) {
         rms_norm(&hidden_states[s * hidden_size], &normed[s * hidden_size], 
                  hidden_size, 1e-5f);
+        /* Apply learned norm weights */
+        if (model->input_layernorm[layer_idx]) {
+            for (int d = 0; d < hidden_size; d++)
+                normed[s * hidden_size + d] *= model->input_layernorm[layer_idx][d];
+        }
     }
     
     /* Q, K, V projections using optimized INT8 matmul kernels */
@@ -325,10 +330,14 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
     /* Save residual for FFN */
     memcpy(residual, hidden_states, seq_len * hidden_size * sizeof(float));
     
-    /* Post-attention RMS norm */
+    /* Post-attention RMS norm with learned weights */
     for (int s = 0; s < seq_len; s++) {
         rms_norm(&hidden_states[s * hidden_size], &ff_normed[s * hidden_size],
                  hidden_size, 1e-5f);
+        if (model->post_attn_layernorm[layer_idx]) {
+            for (int d = 0; d < hidden_size; d++)
+                ff_normed[s * hidden_size + d] *= model->post_attn_layernorm[layer_idx][d];
+        }
     }
     
     /* FFN: gate_proj and up_proj using optimized kernels */
@@ -433,11 +442,15 @@ void model_forward(transformer_model_t* model,
     fprintf(stderr, "[fwd] hidden state L2: %.6f\n", hs_sum);
     fflush(stderr);
     
-    /* Final RMS norm (Phi-3 style) */
+    /* Final RMS norm with learned weights */
     float* normed = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     for (int s = 0; s < seq_len; s++) {
         rms_norm(&hidden_states[s * hidden_size], &normed[s * hidden_size],
                  hidden_size, 1e-5f);
+        if (model->output_norm) {
+            for (int d = 0; d < hidden_size; d++)
+                normed[s * hidden_size + d] *= model->output_norm[d];
+        }
     }
     
     /* LM head projection using optimized kernel */
