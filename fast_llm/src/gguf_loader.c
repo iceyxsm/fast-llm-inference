@@ -566,9 +566,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                    (unsigned long long)tensors[i].size);
         }
         
-        /* Get dimensions */
+        /* Get dimensions — GGUF dims[0] and dims[1] as stored in the file.
+         * For weight matrices, the data is dequantized into a flat array of
+         * rows*cols floats. We store as [out_dim, in_dim] for matvec. */
         int rows = (tensors[i].n_dims > 0) ? tensors[i].dims[0] : 1;
         int cols = (tensors[i].n_dims > 1) ? tensors[i].dims[1] : 1;
+        int num_elems_1d = (tensors[i].n_dims == 1) ? rows : rows;
         
         /* Dequantize and store based on type */
         if ((tensors[i].type == GGML_TYPE_Q4_0 || 
@@ -627,37 +630,14 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 dequantize_q6_K(tensor_data, f32_data, num_elements);
             }
             
-            /* Convert to dequantized tensor format */
-            /* GGUF may store weights as [in_features, out_features] or [out_features, in_features] */
-            /* Detect by checking if rows < cols for non-square matrices */
-            /* For the matmul, we need [out_features, in_features] */
-            int out_dim, in_dim;
-            int need_transpose = 0;
-
-            if (proj_type == PROJ_LM_HEAD || proj_type == PROJ_EMBED) {
-                /* LM head and embeddings: rows is already the larger dim */
-                out_dim = rows;
-                in_dim = cols;
-            } else if (proj_type == PROJ_Q || proj_type == PROJ_O) {
-                /* Square matrices: no transpose needed */
-                out_dim = rows;
-                in_dim = cols;
-            } else {
-                /* For non-square weight matrices, GGUF stores [in, out] */
-                /* We need [out, in] for our matmul */
-                out_dim = cols;
-                in_dim = rows;
-                need_transpose = 1;
-            }
-
-            if (need_transpose) {
-                float* transposed = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
-                for (int r = 0; r < rows; r++)
-                    for (int c = 0; c < cols; c++)
-                        transposed[c * rows + r] = f32_data[r * cols + c];
-                aligned_free(f32_data);
-                f32_data = transposed;
-            }
+            /* GGUF stores weight data as [ne[0], ne[1]] in row-major order.
+             * ne[0] = rows (contiguous), ne[1] = cols.
+             * For weight matrices, GGUF convention is ne[0]=out_features, ne[1]=in_features
+             * when the tensor name follows standard patterns.
+             * Our matvec expects [out_dim, in_dim].
+             * We use the tensor dimensions directly — no transpose needed. */
+            int out_dim = rows;
+            int in_dim = cols;
 
             dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
             dt->rows = out_dim;
@@ -890,38 +870,20 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             /* Handle norms (store as float) */
             else if (proj_type == PROJ_NORM && layer_idx >= 0 && layer_idx < config.num_layers) {
                 if (strstr(tensors[i].name, "attn_norm") || strstr(tensors[i].name, "input_layernorm")) {
-                    model->input_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
-                    memcpy(model->input_layernorm[layer_idx], f32_data, rows * sizeof(float));
+                    model->input_layernorm[layer_idx] = aligned_malloc(num_elems_1d * sizeof(float), 64);
+                    memcpy(model->input_layernorm[layer_idx], f32_data, num_elems_1d * sizeof(float));
                     loaded_tensors++;
                 } else if (strstr(tensors[i].name, "ffn_norm") || strstr(tensors[i].name, "post_attention_layernorm")) {
-                    model->post_attn_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
-                    memcpy(model->post_attn_layernorm[layer_idx], f32_data, rows * sizeof(float));
+                    model->post_attn_layernorm[layer_idx] = aligned_malloc(num_elems_1d * sizeof(float), 64);
+                    memcpy(model->post_attn_layernorm[layer_idx], f32_data, num_elems_1d * sizeof(float));
                     loaded_tensors++;
                 }
                 aligned_free(f32_data);
             }
-            /* Handle weight matrices (convert to int8 dequantized, with transpose if needed) */
+            /* Handle weight matrices — use dimensions directly */
             else {
-                int out_dim, in_dim;
-                int need_transpose = 0;
-
-                if (proj_type == PROJ_LM_HEAD) {
-                    out_dim = rows; in_dim = cols;
-                } else if (proj_type == PROJ_Q || proj_type == PROJ_O) {
-                    out_dim = rows; in_dim = cols;
-                } else {
-                    out_dim = cols; in_dim = rows;
-                    need_transpose = 1;
-                }
-
-                if (need_transpose) {
-                    float* transposed = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
-                    for (int r = 0; r < rows; r++)
-                        for (int c = 0; c < cols; c++)
-                            transposed[c * rows + r] = f32_data[r * cols + c];
-                    aligned_free(f32_data);
-                    f32_data = transposed;
-                }
+                int out_dim = rows;
+                int in_dim = cols;
 
                 dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
                 dt->rows = out_dim;
@@ -965,18 +927,18 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             /* Handle float32 tensors (norms, biases) */
             if (proj_type == PROJ_NORM && layer_idx >= 0 && layer_idx < config.num_layers) {
                 if (strstr(tensors[i].name, "attn_norm") || strstr(tensors[i].name, "input_layernorm") || strstr(tensors[i].name, "ln1")) {
-                    model->input_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
-                    memcpy(model->input_layernorm[layer_idx], tensor_data, rows * sizeof(float));
+                    model->input_layernorm[layer_idx] = aligned_malloc(num_elems_1d * sizeof(float), 64);
+                    memcpy(model->input_layernorm[layer_idx], tensor_data, num_elems_1d * sizeof(float));
                     loaded_tensors++;
                 } else if (strstr(tensors[i].name, "ffn_norm") || strstr(tensors[i].name, "post_attention_layernorm") || strstr(tensors[i].name, "ln2")) {
-                    model->post_attn_layernorm[layer_idx] = aligned_malloc(rows * sizeof(float), 64);
-                    memcpy(model->post_attn_layernorm[layer_idx], tensor_data, rows * sizeof(float));
+                    model->post_attn_layernorm[layer_idx] = aligned_malloc(num_elems_1d * sizeof(float), 64);
+                    memcpy(model->post_attn_layernorm[layer_idx], tensor_data, num_elems_1d * sizeof(float));
                     loaded_tensors++;
                 }
             } else if (proj_type == PROJ_NORM && layer_idx < 0) {
                 /* Final output norm */
-                model->output_norm = aligned_malloc(rows * sizeof(float), 64);
-                memcpy(model->output_norm, tensor_data, rows * sizeof(float));
+                model->output_norm = aligned_malloc(num_elems_1d * sizeof(float), 64);
+                memcpy(model->output_norm, tensor_data, num_elems_1d * sizeof(float));
                 loaded_tensors++;
             }
         }

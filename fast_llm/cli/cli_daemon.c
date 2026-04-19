@@ -126,35 +126,29 @@ int daemon_send(int port, const char* cmd, char* resp, int rsz) {
 #define SP_SPACE "\xE2\x96\x81"
 #define SP_SPACE_LEN 3
 
+/* BPE "Ġ" in UTF-8: 0xC4 0xA0 (used by Llama 3, GPT-2 style tokenizers) */
+#define BPE_SPACE "\xC4\xA0"
+#define BPE_SPACE_LEN 2
+
 /*
- * Convert raw text to SentencePiece-compatible form:
- *   - Leading space and spaces become "▁"
- *   - This matches how most LLM tokenizers represent word boundaries
+ * Detect tokenizer convention by scanning vocabulary.
+ * Returns: 1 = SentencePiece (▁), 2 = BPE (Ġ), 0 = unknown/plain
  */
-static int sp_normalize(const char* text, char* out, int osz) {
-    int pos = 0;
-    const char* p = text;
-
-    /* SentencePiece prepends ▁ to the first token (represents leading space) */
-    if (*p && *p != ' ') {
-        if (pos + SP_SPACE_LEN < osz) {
-            memcpy(out + pos, SP_SPACE, SP_SPACE_LEN);
-            pos += SP_SPACE_LEN;
-        }
+static int detect_tokenizer_type(transformer_model_t* model) {
+    if (!model->vocab_loaded || !model->vocab_tokens) return 0;
+    int sp_count = 0, bpe_count = 0;
+    int limit = model->config.vocab_size < 10000 ? model->config.vocab_size : 10000;
+    for (int v = 0; v < limit; v++) {
+        const char* tok = model->vocab_tokens[v];
+        if (!tok) continue;
+        if ((unsigned char)tok[0] == 0xE2 && (unsigned char)tok[1] == 0x96 && (unsigned char)tok[2] == 0x81)
+            sp_count++;
+        if ((unsigned char)tok[0] == 0xC4 && (unsigned char)tok[1] == 0xA0)
+            bpe_count++;
     }
-
-    while (*p && pos < osz - 4) {
-        if (*p == ' ') {
-            /* Replace space with ▁ */
-            memcpy(out + pos, SP_SPACE, SP_SPACE_LEN);
-            pos += SP_SPACE_LEN;
-            p++;
-        } else {
-            out[pos++] = *p++;
-        }
-    }
-    out[pos] = '\0';
-    return pos;
+    if (sp_count > bpe_count && sp_count > 50) return 1;  /* SentencePiece */
+    if (bpe_count > sp_count && bpe_count > 50) return 2;  /* BPE */
+    return 0;  /* Plain / no space prefix */
 }
 
 /*
@@ -181,7 +175,11 @@ static int append_special(transformer_model_t* model, const char* tag, int* toke
     return count;
 }
 
-/* BPE-style tokenize: greedy longest match against vocab */
+/*
+ * BPE-style tokenize: greedy longest match against vocab.
+ * Handles both SentencePiece (▁) and BPE (Ġ) space conventions.
+ * For plain tokenizers (no space prefix), matches raw text directly.
+ */
 static int real_tokenize_raw(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
     int count = 0;
 
@@ -189,20 +187,55 @@ static int real_tokenize_raw(transformer_model_t* model, const char* text, int* 
         /* Fallback: byte-level encoding using low token IDs */
         const unsigned char* p = (const unsigned char*)text;
         while (*p && count < max_tokens - 1) {
-            /* Use token IDs 3..258 for raw bytes (common in BPE vocabs) */
             tokens[count++] = 3 + *p;
             p++;
         }
         return count;
     }
 
-    /* Normalize text: convert spaces to ▁ for SentencePiece matching */
-    int norm_sz = (int)strlen(text) * 4 + 16;
-    char* normalized = malloc(norm_sz);
-    sp_normalize(text, normalized, norm_sz);
+    int tok_type = detect_tokenizer_type(model);
+    const char* space_prefix = NULL;
+    int space_prefix_len = 0;
+
+    if (tok_type == 1) {
+        space_prefix = SP_SPACE;
+        space_prefix_len = SP_SPACE_LEN;
+    } else if (tok_type == 2) {
+        space_prefix = BPE_SPACE;
+        space_prefix_len = BPE_SPACE_LEN;
+    }
+
+    /* Normalize text: convert spaces to the tokenizer's space prefix */
+    char* normalized = NULL;
+    const char* match_text = text;
+
+    if (space_prefix) {
+        int norm_sz = (int)strlen(text) * 4 + 16;
+        normalized = malloc(norm_sz);
+        int pos = 0;
+        const char* p = text;
+
+        /* Prepend space prefix to first word (standard for both SP and BPE) */
+        if (*p && *p != ' ') {
+            memcpy(normalized + pos, space_prefix, space_prefix_len);
+            pos += space_prefix_len;
+        }
+
+        while (*p && pos < norm_sz - 4) {
+            if (*p == ' ') {
+                memcpy(normalized + pos, space_prefix, space_prefix_len);
+                pos += space_prefix_len;
+                p++;
+            } else {
+                normalized[pos++] = *p++;
+            }
+        }
+        normalized[pos] = '\0';
+        match_text = normalized;
+    }
 
     int vocab_size = model->config.vocab_size;
-    const char* p = normalized;
+    const char* p = match_text;
 
     while (*p && count < max_tokens - 1) {
         int best_len = 0;
@@ -230,7 +263,6 @@ static int real_tokenize_raw(transformer_model_t* model, const char* text, int* 
             /* Single byte fallback — try to find a byte token */
             int found = 0;
             unsigned char ch = (unsigned char)*p;
-            /* Search for single-char token matching this byte */
             for (int v = 0; v < vocab_size; v++) {
                 const char* tok = model->vocab_tokens[v];
                 if (tok && strlen(tok) == 1 && (unsigned char)tok[0] == ch) {
@@ -247,7 +279,7 @@ static int real_tokenize_raw(transformer_model_t* model, const char* text, int* 
         }
     }
 
-    free(normalized);
+    if (normalized) free(normalized);
     return count;
 }
 
@@ -364,13 +396,18 @@ static int real_detokenize(transformer_model_t* model, const int* tokens, int nt
         const char* tok = model->vocab_tokens[id];
         if (!tok) continue;
 
-        /* BPE tokens often have "▁" (U+2581) for space — replace with actual space */
+        /* Handle both space conventions:
+         * SentencePiece: "▁" (UTF-8: 0xE2 0x96 0x81) → space
+         * BPE:           "Ġ" (UTF-8: 0xC4 0xA0) → space
+         */
         const char* p = tok;
         while (*p && pos < osz - 1) {
-            /* Check for ▁ (UTF-8: 0xE2 0x96 0x81) */
             if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81) {
                 out[pos++] = ' ';
                 p += 3;
+            } else if ((unsigned char)p[0] == 0xC4 && (unsigned char)p[1] == 0xA0) {
+                out[pos++] = ' ';
+                p += 2;
             } else {
                 out[pos++] = *p++;
             }
