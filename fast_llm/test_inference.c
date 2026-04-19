@@ -78,7 +78,8 @@ int main(int argc, char* argv[]) {
     int seq_len = 2;
     int vocab = model->config.vocab_size;
 
-    printf("\nRunning forward pass (input: [1, 15339], seq_len=%d, vocab=%d)...\n", seq_len, vocab);
+    printf("Running forward pass (input: [1, 15339], seq_len=%d, vocab=%d)...\n", seq_len, vocab);
+    printf("  Embedding lookup...\n"); fflush(stdout);
 
     float* logits = (float*)aligned_malloc(vocab * sizeof(float), 64);
     int next_token = 0;

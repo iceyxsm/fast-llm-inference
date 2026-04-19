@@ -551,7 +551,7 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         parse_tensor_name(tensors[i].name, &layer_idx, &proj_type);
         
         /* Debug: print first few tensor names */
-        if (i < 10) {
+        if (i < 10 || strstr(tensors[i].name, "output")) {
             printf("  Tensor %d: %s -> layer=%d proj=%d type=%d dims=%llux%llu size=%llu\n", 
                    (int)i, tensors[i].name, layer_idx, proj_type, tensors[i].type,
                    (unsigned long long)tensors[i].dims[0], 
@@ -584,28 +584,61 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             }
             
             /* Convert to dequantized tensor format */
+            /* GGUF may store weights as [in_features, out_features] or [out_features, in_features] */
+            /* Detect by checking if rows < cols for non-square matrices */
+            /* For the matmul, we need [out_features, in_features] */
+            int out_dim, in_dim;
+            int need_transpose = 0;
+
+            if (proj_type == PROJ_LM_HEAD || proj_type == PROJ_EMBED) {
+                /* LM head and embeddings: rows is already the larger dim */
+                out_dim = rows;
+                in_dim = cols;
+            } else if (proj_type == PROJ_Q || proj_type == PROJ_O) {
+                /* Square matrices: no transpose needed */
+                out_dim = rows;
+                in_dim = cols;
+            } else {
+                /* For non-square weight matrices, GGUF stores [in, out] */
+                /* We need [out, in] for our matmul */
+                out_dim = cols;
+                in_dim = rows;
+                need_transpose = 1;
+            }
+
+            float* mat_data = f32_data;
+            if (need_transpose) {
+                float* transposed = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
+                for (int r = 0; r < rows; r++)
+                    for (int c = 0; c < cols; c++)
+                        transposed[c * rows + r] = f32_data[r * cols + c];
+                aligned_free(f32_data);
+                mat_data = transposed;
+                f32_data = transposed;
+            }
+
             dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
-            dt->rows = rows;
-            dt->cols = cols;
-            dt->weights = aligned_malloc(rows * cols, 64);
-            dt->scales = aligned_malloc(rows * sizeof(float), 64);
+            dt->rows = out_dim;
+            dt->cols = in_dim;
+            dt->weights = aligned_malloc(out_dim * in_dim, 64);
+            dt->scales = aligned_malloc(out_dim * sizeof(float), 64);
             
             /* Quantize to int8 per row */
-            for (int r = 0; r < rows; r++) {
+            for (int r = 0; r < out_dim; r++) {
                 float max_abs = 0.0f;
-                for (int c = 0; c < cols; c++) {
-                    float v = fabsf(f32_data[r * cols + c]);
+                for (int c = 0; c < in_dim; c++) {
+                    float v = fabsf(f32_data[r * in_dim + c]);
                     if (v > max_abs) max_abs = v;
                 }
                 
                 dt->scales[r] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
                 float inv_scale = 1.0f / dt->scales[r];
                 
-                for (int c = 0; c < cols; c++) {
-                    float scaled = f32_data[r * cols + c] * inv_scale;
+                for (int c = 0; c < in_dim; c++) {
+                    float scaled = f32_data[r * in_dim + c] * inv_scale;
                     if (scaled > 127) scaled = 127;
                     if (scaled < -128) scaled = -128;
-                    dt->weights[r * cols + c] = (int8_t)roundf(scaled);
+                    dt->weights[r * in_dim + c] = (int8_t)roundf(scaled);
                 }
             }
             
@@ -679,18 +712,42 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 model->lm_head = dt;
                 loaded_tensors++;
             } else if (proj_type == PROJ_EMBED) {
-                /* Copy to token embeddings */
-                printf("  [Embed: rows=%d cols=%d, vocab=%d hidden=%d]\n", rows, cols, config.vocab_size, config.hidden_size);
-                /* Check if dequantized data has non-zero values */
-                float sample = dt->weights[0] * dt->scales[0];
-                printf("  [Embed sample: w[0]=%d s[0]=%.6f val=%.6f]\n", dt->weights[0], dt->scales[0], sample);
-                for (int r = 0; r < rows && r < config.vocab_size; r++) {
-                    for (int c = 0; c < cols && c < config.hidden_size; c++) {
-                        model->token_embeddings[r * config.hidden_size + c] = 
-                            dt->weights[r * cols + c] * dt->scales[r];
+                /* GGUF stores embeddings as [hidden_size, vocab_size], we need [vocab_size, hidden_size] */
+                /* Transpose during copy */
+                int emb_hidden = (rows < cols) ? rows : cols;
+                int emb_vocab = (rows < cols) ? cols : rows;
+                if (emb_hidden > config.hidden_size) emb_hidden = config.hidden_size;
+                if (emb_vocab > config.vocab_size) emb_vocab = config.vocab_size;
+                printf("  [Embed: tensor %dx%d -> transposing to [%d, %d]]\n", rows, cols, emb_vocab, emb_hidden);
+
+                /* Dequantize to float first */
+                float* emb_f32 = aligned_malloc(rows * cols * sizeof(float), 64);
+                for (int r = 0; r < rows; r++) {
+                    for (int c = 0; c < cols; c++) {
+                        emb_f32[r * cols + c] = dt->weights[r * cols + c] * dt->scales[r];
                     }
                 }
+
+                /* Copy with transpose if needed */
+                if (rows == config.hidden_size && cols >= config.vocab_size) {
+                    /* Stored as [hidden, vocab] — transpose to [vocab, hidden] */
+                    for (int v = 0; v < emb_vocab; v++) {
+                        for (int h = 0; h < emb_hidden; h++) {
+                            model->token_embeddings[v * config.hidden_size + h] = emb_f32[h * cols + v];
+                        }
+                    }
+                } else {
+                    /* Stored as [vocab, hidden] — direct copy */
+                    for (int v = 0; v < emb_vocab; v++) {
+                        for (int h = 0; h < emb_hidden; h++) {
+                            model->token_embeddings[v * config.hidden_size + h] = emb_f32[v * cols + h];
+                        }
+                    }
+                }
+                aligned_free(emb_f32);
                 dequantized_tensor_free(dt);
+                loaded_tensors++;
+                printf("  [Embed loaded: sample token 1 = %.6f]\n", model->token_embeddings[1 * config.hidden_size]);
             } else {
                 skipped_tensors++;
                 /* Debug: print first few unmapped tensors */
@@ -731,12 +788,20 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 memcpy(&f32_data[e], &f, 4);
             }
 
-            /* Handle embeddings (store as float directly) */
+            /* Handle embeddings (store as float directly, with transpose if needed) */
             if (proj_type == PROJ_EMBED) {
-                for (int r = 0; r < rows && r < config.vocab_size; r++) {
-                    for (int c = 0; c < cols && c < config.hidden_size; c++) {
-                        model->token_embeddings[r * config.hidden_size + c] = f32_data[r * cols + c];
-                    }
+                if (rows == config.hidden_size && cols >= config.vocab_size) {
+                    /* [hidden, vocab] -> transpose to [vocab, hidden] */
+                    int ev = cols < config.vocab_size ? cols : config.vocab_size;
+                    for (int v = 0; v < ev; v++)
+                        for (int h = 0; h < rows && h < config.hidden_size; h++)
+                            model->token_embeddings[v * config.hidden_size + h] = f32_data[h * cols + v];
+                } else {
+                    /* [vocab, hidden] -> direct copy */
+                    int ev = rows < config.vocab_size ? rows : config.vocab_size;
+                    for (int v = 0; v < ev; v++)
+                        for (int h = 0; h < cols && h < config.hidden_size; h++)
+                            model->token_embeddings[v * config.hidden_size + h] = f32_data[v * cols + h];
                 }
                 aligned_free(f32_data);
                 loaded_tensors++;
@@ -755,27 +820,48 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 }
                 aligned_free(f32_data);
             }
-            /* Handle weight matrices (convert to int8 dequantized) */
+            /* Handle weight matrices (convert to int8 dequantized, with transpose if needed) */
             else {
-                dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
-                dt->rows = rows;
-                dt->cols = cols;
-                dt->weights = aligned_malloc(rows * cols, 64);
-                dt->scales = aligned_malloc(rows * sizeof(float), 64);
+                int out_dim, in_dim;
+                int need_transpose = 0;
 
-                for (int r = 0; r < rows; r++) {
+                if (proj_type == PROJ_LM_HEAD) {
+                    out_dim = rows; in_dim = cols;
+                } else if (proj_type == PROJ_Q || proj_type == PROJ_O) {
+                    out_dim = rows; in_dim = cols;
+                } else {
+                    out_dim = cols; in_dim = rows;
+                    need_transpose = 1;
+                }
+
+                if (need_transpose) {
+                    float* transposed = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
+                    for (int r = 0; r < rows; r++)
+                        for (int c = 0; c < cols; c++)
+                            transposed[c * rows + r] = f32_data[r * cols + c];
+                    aligned_free(f32_data);
+                    f32_data = transposed;
+                }
+
+                dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
+                dt->rows = out_dim;
+                dt->cols = in_dim;
+                dt->weights = aligned_malloc(out_dim * in_dim, 64);
+                dt->scales = aligned_malloc(out_dim * sizeof(float), 64);
+
+                for (int r = 0; r < out_dim; r++) {
                     float max_abs = 0.0f;
-                    for (int c = 0; c < cols; c++) {
-                        float v = fabsf(f32_data[r * cols + c]);
+                    for (int c = 0; c < in_dim; c++) {
+                        float v = fabsf(f32_data[r * in_dim + c]);
                         if (v > max_abs) max_abs = v;
                     }
                     dt->scales[r] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
                     float inv_scale = 1.0f / dt->scales[r];
-                    for (int c = 0; c < cols; c++) {
-                        float scaled = f32_data[r * cols + c] * inv_scale;
+                    for (int c = 0; c < in_dim; c++) {
+                        float scaled = f32_data[r * in_dim + c] * inv_scale;
                         if (scaled > 127) scaled = 127;
                         if (scaled < -128) scaled = -128;
-                        dt->weights[r * cols + c] = (int8_t)roundf(scaled);
+                        dt->weights[r * in_dim + c] = (int8_t)roundf(scaled);
                     }
                 }
                 aligned_free(f32_data);
@@ -831,6 +917,27 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     
     printf("\nLoaded: %d tensors (%zu MB)\n", loaded_tensors, total_bytes / (1024*1024));
     printf("Skipped: %d tensors\n", skipped_tensors);
+
+    /* Handle tied embeddings: if LM head is all zeros, copy from token embeddings */
+    if (model->lm_head && model->lm_head->weights[0] == 0 && model->lm_head->scales[0] == 0.0f) {
+        printf("  LM head empty — using tied embeddings\n");
+        /* The LM head should be [vocab_size, hidden_size] same as embeddings */
+        for (int v = 0; v < config.vocab_size; v++) {
+            float max_abs = 0.0f;
+            for (int h = 0; h < config.hidden_size; h++) {
+                float val = fabsf(model->token_embeddings[v * config.hidden_size + h]);
+                if (val > max_abs) max_abs = val;
+            }
+            model->lm_head->scales[v] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
+            float inv_scale = 1.0f / model->lm_head->scales[v];
+            for (int h = 0; h < config.hidden_size; h++) {
+                float scaled = model->token_embeddings[v * config.hidden_size + h] * inv_scale;
+                if (scaled > 127) scaled = 127;
+                if (scaled < -128) scaled = -128;
+                model->lm_head->weights[v * config.hidden_size + h] = (int8_t)roundf(scaled);
+            }
+        }
+    }
     if (skipped_tensors > 100) {
         printf("WARNING: Most tensors were skipped!\n");
     }

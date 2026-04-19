@@ -129,54 +129,52 @@ static void matmul_float(const float* A, const float* B, float* C,
 
 /* Attention computation: Q @ K^T / sqrt(d_k) */
 static void compute_attention(const float* Q, const float* K, const float* V,
-                              float* output, int seq_len, int num_heads, int head_dim) {
-    int head_size = head_dim;
+                              float* output, int seq_len, int num_heads, int num_kv_heads, int head_dim) {
     float scale = 1.0f / sqrtf((float)head_dim);
+    int kv_group = num_heads / num_kv_heads; /* how many Q heads per KV head */
     
     #pragma omp parallel for
     for (int h = 0; h < num_heads; h++) {
-        const float* Q_h = Q + h * head_size;
-        const float* K_h = K + h * head_size;
-        const float* V_h = V + h * head_size;
-        float* out_h = output + h * head_size;
+        int kv_h = h / kv_group; /* which KV head this Q head uses */
         
-        /* Compute Q @ K^T for this head */
         float scores[4096]; /* Max seq len */
         
         for (int q_pos = 0; q_pos < seq_len; q_pos++) {
+            /* Q is laid out as [seq_len, num_heads, head_dim] */
+            const float* q_vec = Q + q_pos * num_heads * head_dim + h * head_dim;
+            
             for (int k_pos = 0; k_pos <= q_pos; k_pos++) {
+                /* K is laid out as [seq_len, num_kv_heads, head_dim] */
+                const float* k_vec = K + k_pos * num_kv_heads * head_dim + kv_h * head_dim;
                 float dot = 0.0f;
-                for (int d = 0; d < head_size; d++) {
-                    dot += Q_h[q_pos * num_heads * head_size + d] * 
-                           K_h[k_pos * num_heads * head_size + d];
+                for (int d = 0; d < head_dim; d++) {
+                    dot += q_vec[d] * k_vec[d];
                 }
                 scores[k_pos] = dot * scale;
             }
             
-            /* Apply causal mask (already handled by k_pos <= q_pos) */
-            /* Softmax over attended positions */
+            /* Softmax */
             float max_score = scores[0];
-            for (int k = 1; k <= q_pos; k++) {
+            for (int k = 1; k <= q_pos; k++)
                 if (scores[k] > max_score) max_score = scores[k];
-            }
             
             float sum = 0.0f;
             for (int k = 0; k <= q_pos; k++) {
                 scores[k] = expf(scores[k] - max_score);
                 sum += scores[k];
             }
-            
-            for (int k = 0; k <= q_pos; k++) {
+            for (int k = 0; k <= q_pos; k++)
                 scores[k] /= sum;
-            }
             
-            /* Weighted sum of values */
-            for (int d = 0; d < head_size; d++) {
+            /* Weighted sum of V */
+            float* out_vec = output + q_pos * num_heads * head_dim + h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
                 float val = 0.0f;
                 for (int k = 0; k <= q_pos; k++) {
-                    val += scores[k] * V_h[k * num_heads * head_size + d];
+                    const float* v_vec = V + k * num_kv_heads * head_dim + kv_h * head_dim;
+                    val += scores[k] * v_vec[d];
                 }
-                out_h[q_pos * num_heads * head_size + d] = val;
+                out_vec[d] = val;
             }
         }
     }
@@ -185,17 +183,20 @@ static void compute_attention(const float* Q, const float* K, const float* V,
 /* Single transformer layer forward pass */
 static void transformer_layer(transformer_model_t* model, int layer_idx,
                                float* hidden_states, int seq_len, int batch_size) {
+    (void)batch_size;
     int hidden_size = model->config.hidden_size;
     int intermediate_size = model->config.intermediate_size;
     int num_heads = model->config.num_heads;
+    int num_kv_heads = model->config.num_kv_heads;
     int head_dim = model->config.head_dim;
+    int kv_dim = num_kv_heads * head_dim; /* K/V output size for GQA */
     
     /* Allocate temporaries */
     float* residual = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     float* normed = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     float* q = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
-    float* k = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
-    float* v = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
+    float* k = aligned_malloc(seq_len * kv_dim * sizeof(float), 32);
+    float* v = aligned_malloc(seq_len * kv_dim * sizeof(float), 32);
     float* attn_out = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     float* ff_normed = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     float* gate = aligned_malloc(seq_len * intermediate_size * sizeof(float), 32);
@@ -214,8 +215,8 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
     for (int s = 0; s < seq_len; s++) {
         float* norm_row = &normed[s * hidden_size];
         float* q_row = &q[s * hidden_size];
-        float* k_row = &k[s * hidden_size];
-        float* v_row = &v[s * hidden_size];
+        float* k_row = &k[s * kv_dim];
+        float* v_row = &v[s * kv_dim];
         
         /* Q projection: [hidden] @ [hidden, hidden] -> [hidden] */
         if (model->q_proj[layer_idx]) {
@@ -234,12 +235,12 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
             #endif
         }
         
-        /* K projection */
+        /* K projection: [hidden] @ [kv_dim, hidden] -> [kv_dim] */
         if (model->k_proj[layer_idx]) {
             #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(norm_row, model->k_proj[layer_idx], k_row, 1, hidden_size, hidden_size);
+            matmul_dequantized_asm_style(norm_row, model->k_proj[layer_idx], k_row, 1, kv_dim, hidden_size);
             #else
-            for (int h = 0; h < hidden_size; h++) {
+            for (int h = 0; h < kv_dim; h++) {
                 float sum = 0.0f;
                 const int8_t* w = model->k_proj[layer_idx]->weights;
                 float scale = model->k_proj[layer_idx]->scales[h];
@@ -251,12 +252,12 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
             #endif
         }
         
-        /* V projection */
+        /* V projection: [hidden] @ [kv_dim, hidden] -> [kv_dim] */
         if (model->v_proj[layer_idx]) {
             #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(norm_row, model->v_proj[layer_idx], v_row, 1, hidden_size, hidden_size);
+            matmul_dequantized_asm_style(norm_row, model->v_proj[layer_idx], v_row, 1, kv_dim, hidden_size);
             #else
-            for (int h = 0; h < hidden_size; h++) {
+            for (int h = 0; h < kv_dim; h++) {
                 float sum = 0.0f;
                 const int8_t* w = model->v_proj[layer_idx]->weights;
                 float scale = model->v_proj[layer_idx]->scales[h];
@@ -270,7 +271,7 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
     }
     
     /* Multi-head attention */
-    compute_attention(q, k, v, attn_out, seq_len, num_heads, head_dim);
+    compute_attention(q, k, v, attn_out, seq_len, num_heads, num_kv_heads, head_dim);
     
     /* O projection using optimized kernel */
     for (int s = 0; s < seq_len; s++) {
@@ -428,18 +429,32 @@ void model_forward(transformer_model_t* model,
     float* hidden_states = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
     
     /* Embedding lookup */
+    fprintf(stderr, "[fwd] embedding lookup, seq=%d, hidden=%d, vocab=%d\n", seq_len, hidden_size, vocab_size);
+    fflush(stderr);
     for (int s = 0; s < seq_len; s++) {
         int token = input_tokens[s];
-        if (token >= vocab_size) token = 0; /* Bounds check */
+        if (token >= vocab_size) token = 0;
         memcpy(&hidden_states[s * hidden_size],
                &model->token_embeddings[token * hidden_size],
                hidden_size * sizeof(float));
     }
+    fprintf(stderr, "[fwd] embedding done, running %d layers\n", num_layers);
+    fflush(stderr);
     
     /* Run through all transformer layers */
     for (int layer = 0; layer < num_layers; layer++) {
+        fprintf(stderr, "[fwd] layer %d/%d\n", layer, num_layers);
+        fflush(stderr);
         transformer_layer(model, layer, hidden_states, seq_len, 1);
     }
+    fprintf(stderr, "[fwd] all layers done, computing logits\n");
+    fflush(stderr);
+
+    /* Check hidden state */
+    float hs_sum = 0;
+    for (int i = 0; i < hidden_size; i++) hs_sum += hidden_states[(seq_len-1)*hidden_size + i] * hidden_states[(seq_len-1)*hidden_size + i];
+    fprintf(stderr, "[fwd] hidden state L2: %.6f\n", hs_sum);
+    fflush(stderr);
     
     /* Final RMS norm (Phi-3 style) */
     float* normed = aligned_malloc(seq_len * hidden_size * sizeof(float), 32);
@@ -455,6 +470,12 @@ void model_forward(transformer_model_t* model,
     float* last_hidden = &normed[(seq_len - 1) * hidden_size];
     
     if (model->lm_head) {
+        /* Check LM head weights */
+        float lm_sample = model->lm_head->weights[0] * model->lm_head->scales[0];
+        fprintf(stderr, "[fwd] LM head: rows=%d cols=%d w[0]=%d s[0]=%.6f val=%.6f\n",
+            model->lm_head->rows, model->lm_head->cols,
+            model->lm_head->weights[0], model->lm_head->scales[0], lm_sample);
+        fflush(stderr);
         #if USE_OPTIMIZED_MATMUL
         matmul_dequantized_asm_style(last_hidden, model->lm_head, logits, 1, vocab_size, hidden_size);
         #else
