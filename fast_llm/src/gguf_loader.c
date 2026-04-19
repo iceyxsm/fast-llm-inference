@@ -585,8 +585,6 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
 
             /* Dequantize one row at a time (one row = one hidden dim across all vocab) */
             float* row_buf = aligned_malloc(emb_vocab * sizeof(float), 64);
-            int block_size = 256;
-            int blocks_per_row = emb_vocab / block_size;
 
             for (int h = 0; h < emb_hidden; h++) {
                 /* Dequantize row h: block_size elements at a time */
@@ -652,14 +650,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 need_transpose = 1;
             }
 
-            float* mat_data = f32_data;
             if (need_transpose) {
                 float* transposed = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
                 for (int r = 0; r < rows; r++)
                     for (int c = 0; c < cols; c++)
                         transposed[c * rows + r] = f32_data[r * cols + c];
                 aligned_free(f32_data);
-                mat_data = transposed;
                 f32_data = transposed;
             }
 
@@ -678,38 +674,77 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             
             /* Handle fused QKV - split into Q, K, V */
             if (strstr(tensors[i].name, "attn_qkv")) {
-                /* QKV fused: rows = 3 * hidden_size, split into 3 parts */
+                /* QKV fused: out_dim = 3 * hidden_size, split into 3 parts */
                 int hidden_size = config.hidden_size;
-                
-                /* Create Q tensor (first third) */
-                dequantized_tensor_t* dt_q = malloc(sizeof(dequantized_tensor_t));
-                dt_q->rows = hidden_size;
-                dt_q->cols = cols;
-                dt_q->weights = aligned_malloc(hidden_size * cols, 64);
-                dt_q->scales = aligned_malloc(hidden_size * sizeof(float), 64);
-                memcpy(dt_q->weights, dt->weights, hidden_size * cols);
-                memcpy(dt_q->scales, dt->scales, hidden_size * sizeof(float));
-                model->q_proj[layer_idx] = dt_q;
-                
-                /* Create K tensor (middle third) */
-                dequantized_tensor_t* dt_k = malloc(sizeof(dequantized_tensor_t));
-                dt_k->rows = hidden_size;
-                dt_k->cols = cols;
-                dt_k->weights = aligned_malloc(hidden_size * cols, 64);
-                dt_k->scales = aligned_malloc(hidden_size * sizeof(float), 64);
-                memcpy(dt_k->weights, dt->weights + hidden_size * cols, hidden_size * cols);
-                memcpy(dt_k->scales, dt->scales + hidden_size, hidden_size * sizeof(float));
-                model->k_proj[layer_idx] = dt_k;
-                
-                /* Create V tensor (last third) */
-                dequantized_tensor_t* dt_v = malloc(sizeof(dequantized_tensor_t));
-                dt_v->rows = hidden_size;
-                dt_v->cols = cols;
-                dt_v->weights = aligned_malloc(hidden_size * cols, 64);
-                dt_v->scales = aligned_malloc(hidden_size * sizeof(float), 64);
-                memcpy(dt_v->weights, dt->weights + 2 * hidden_size * cols, hidden_size * cols);
-                memcpy(dt_v->scales, dt->scales + 2 * hidden_size, hidden_size * sizeof(float));
-                model->v_proj[layer_idx] = dt_v;
+                int kv_dim = config.num_kv_heads * config.head_dim;
+                /* For GQA: Q is hidden_size, K and V are kv_dim each */
+                int q_dim = hidden_size;
+                int k_dim = kv_dim;
+                int v_dim = kv_dim;
+                /* If total doesn't match, fall back to equal split */
+                if (q_dim + k_dim + v_dim != out_dim) {
+                    q_dim = out_dim / 3;
+                    k_dim = out_dim / 3;
+                    v_dim = out_dim - 2 * (out_dim / 3);
+                }
+
+                if (dt->f32_weights) {
+                    /* f32 path */
+                    dequantized_tensor_t* dt_q = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_q, 0, sizeof(*dt_q));
+                    dt_q->rows = q_dim;
+                    dt_q->cols = in_dim;
+                    dt_q->f32_weights = aligned_malloc(q_dim * in_dim * sizeof(float), 64);
+                    memcpy(dt_q->f32_weights, dt->f32_weights, q_dim * in_dim * sizeof(float));
+                    model->q_proj[layer_idx] = dt_q;
+
+                    dequantized_tensor_t* dt_k = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_k, 0, sizeof(*dt_k));
+                    dt_k->rows = k_dim;
+                    dt_k->cols = in_dim;
+                    dt_k->f32_weights = aligned_malloc(k_dim * in_dim * sizeof(float), 64);
+                    memcpy(dt_k->f32_weights, dt->f32_weights + q_dim * in_dim, k_dim * in_dim * sizeof(float));
+                    model->k_proj[layer_idx] = dt_k;
+
+                    dequantized_tensor_t* dt_v = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_v, 0, sizeof(*dt_v));
+                    dt_v->rows = v_dim;
+                    dt_v->cols = in_dim;
+                    dt_v->f32_weights = aligned_malloc(v_dim * in_dim * sizeof(float), 64);
+                    memcpy(dt_v->f32_weights, dt->f32_weights + (q_dim + k_dim) * in_dim, v_dim * in_dim * sizeof(float));
+                    model->v_proj[layer_idx] = dt_v;
+                } else if (dt->weights && dt->scales) {
+                    /* int8 path */
+                    dequantized_tensor_t* dt_q = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_q, 0, sizeof(*dt_q));
+                    dt_q->rows = q_dim;
+                    dt_q->cols = in_dim;
+                    dt_q->weights = aligned_malloc(q_dim * in_dim, 64);
+                    dt_q->scales = aligned_malloc(q_dim * sizeof(float), 64);
+                    memcpy(dt_q->weights, dt->weights, q_dim * in_dim);
+                    memcpy(dt_q->scales, dt->scales, q_dim * sizeof(float));
+                    model->q_proj[layer_idx] = dt_q;
+
+                    dequantized_tensor_t* dt_k = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_k, 0, sizeof(*dt_k));
+                    dt_k->rows = k_dim;
+                    dt_k->cols = in_dim;
+                    dt_k->weights = aligned_malloc(k_dim * in_dim, 64);
+                    dt_k->scales = aligned_malloc(k_dim * sizeof(float), 64);
+                    memcpy(dt_k->weights, dt->weights + q_dim * in_dim, k_dim * in_dim);
+                    memcpy(dt_k->scales, dt->scales + q_dim, k_dim * sizeof(float));
+                    model->k_proj[layer_idx] = dt_k;
+
+                    dequantized_tensor_t* dt_v = malloc(sizeof(dequantized_tensor_t));
+                    memset(dt_v, 0, sizeof(*dt_v));
+                    dt_v->rows = v_dim;
+                    dt_v->cols = in_dim;
+                    dt_v->weights = aligned_malloc(v_dim * in_dim, 64);
+                    dt_v->scales = aligned_malloc(v_dim * sizeof(float), 64);
+                    memcpy(dt_v->weights, dt->weights + (q_dim + k_dim) * in_dim, v_dim * in_dim);
+                    memcpy(dt_v->scales, dt->scales + q_dim + k_dim, v_dim * sizeof(float));
+                    model->v_proj[layer_idx] = dt_v;
+                }
                 
                 /* Free original fused tensor */
                 dequantized_tensor_free(dt);
@@ -738,9 +773,9 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 }
             } else if (proj_type == PROJ_LM_HEAD) {
                 /* Replace LM head */
-                aligned_free(model->lm_head->weights);
-                aligned_free(model->lm_head->scales);
-                free(model->lm_head);
+                if (model->lm_head) {
+                    dequantized_tensor_free(model->lm_head);
+                }
                 model->lm_head = dt;
                 loaded_tensors++;
             } else if (proj_type == PROJ_EMBED) {
@@ -752,12 +787,25 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 if (emb_vocab > config.vocab_size) emb_vocab = config.vocab_size;
                 printf("  [Embed: tensor %dx%d -> transposing to [%d, %d]]\n", rows, cols, emb_vocab, emb_hidden);
 
-                /* Dequantize to float first */
-                float* emb_f32 = aligned_malloc(rows * cols * sizeof(float), 64);
-                for (int r = 0; r < rows; r++) {
-                    for (int c = 0; c < cols; c++) {
-                        emb_f32[r * cols + c] = dt->weights[r * cols + c] * dt->scales[r];
+                /* Use f32_weights if available, otherwise reconstruct from int8 */
+                float* emb_f32 = NULL;
+                int need_free_emb = 0;
+                if (dt->f32_weights) {
+                    emb_f32 = dt->f32_weights;
+                } else if (dt->weights && dt->scales) {
+                    emb_f32 = aligned_malloc(rows * cols * sizeof(float), 64);
+                    need_free_emb = 1;
+                    for (int r = 0; r < rows; r++) {
+                        for (int c = 0; c < cols; c++) {
+                            emb_f32[r * cols + c] = dt->weights[r * cols + c] * dt->scales[r];
+                        }
                     }
+                } else {
+                    printf("  [Embed: no weights available, skipping]\n");
+                    dequantized_tensor_free(dt);
+                    free(tensor_data);
+                    free(tensors[i].name);
+                    continue;
                 }
 
                 /* Copy with transpose if needed */
@@ -776,7 +824,7 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                         }
                     }
                 }
-                aligned_free(emb_f32);
+                if (need_free_emb) aligned_free(emb_f32);
                 dequantized_tensor_free(dt);
                 loaded_tensors++;
                 printf("  [Embed loaded: sample token 1 = %.6f]\n", model->token_embeddings[1 * config.hidden_size]);
@@ -900,9 +948,9 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                     }
                     if (dt) { loaded_tensors++; total_bytes += rows * cols * 2; }
                 } else if (proj_type == PROJ_LM_HEAD) {
-                    aligned_free(model->lm_head->weights);
-                    aligned_free(model->lm_head->scales);
-                    free(model->lm_head);
+                    if (model->lm_head) {
+                        dequantized_tensor_free(model->lm_head);
+                    }
                     model->lm_head = dt;
                     loaded_tensors++;
                 } else {
@@ -942,6 +990,23 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     
     printf("\nLoaded: %d tensors (%zu MB)\n", loaded_tensors, total_bytes / (1024*1024));
     printf("Skipped: %d tensors\n", skipped_tensors);
+
+    /* Validate loaded weights */
+    int loaded_projs = 0;
+    int missing_projs = 0;
+    for (int l = 0; l < config.num_layers; l++) {
+        if (model->q_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->k_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->v_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->o_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->gate_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->up_proj[l]) loaded_projs++; else missing_projs++;
+        if (model->down_proj[l]) loaded_projs++; else missing_projs++;
+    }
+    printf("Weight projections: %d loaded, %d missing (of %d total)\n",
+           loaded_projs, missing_projs, config.num_layers * 7);
+    if (model->output_norm) printf("Output norm: loaded\n");
+    else printf("Output norm: MISSING\n");
 
     /* Handle tied embeddings: if LM head has no weights, use token embeddings */
     if (model->lm_head && !model->lm_head->f32_weights && !model->lm_head->weights) {

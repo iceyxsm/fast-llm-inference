@@ -122,47 +122,100 @@ int daemon_send(int port, const char* cmd, char* resp, int rsz) {
 
 /* ── Tokenizer using model's real vocabulary ───────────────────────── */
 
+/* SentencePiece "▁" in UTF-8: 0xE2 0x96 0x81 */
+#define SP_SPACE "\xE2\x96\x81"
+#define SP_SPACE_LEN 3
+
+/*
+ * Convert raw text to SentencePiece-compatible form:
+ *   - Leading space and spaces become "▁"
+ *   - This matches how most LLM tokenizers represent word boundaries
+ */
+static int sp_normalize(const char* text, char* out, int osz) {
+    int pos = 0;
+    const char* p = text;
+
+    /* SentencePiece prepends ▁ to the first token (represents leading space) */
+    if (*p && *p != ' ') {
+        if (pos + SP_SPACE_LEN < osz) {
+            memcpy(out + pos, SP_SPACE, SP_SPACE_LEN);
+            pos += SP_SPACE_LEN;
+        }
+    }
+
+    while (*p && pos < osz - 4) {
+        if (*p == ' ') {
+            /* Replace space with ▁ */
+            memcpy(out + pos, SP_SPACE, SP_SPACE_LEN);
+            pos += SP_SPACE_LEN;
+            p++;
+        } else {
+            out[pos++] = *p++;
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+/*
+ * Find a special token by exact string match in the vocabulary.
+ * Returns token ID or -1 if not found.
+ */
+static int find_special_token(transformer_model_t* model, const char* text) {
+    if (!model->vocab_loaded || !model->vocab_tokens) return -1;
+    for (int v = 0; v < model->config.vocab_size; v++) {
+        const char* tok = model->vocab_tokens[v];
+        if (tok && strcmp(tok, text) == 0) return v;
+    }
+    return -1;
+}
+
+/*
+ * Tokenize a special token string (e.g. "<|user|>") and append its ID.
+ * If not found in vocab, silently skip.
+ */
+static int append_special(transformer_model_t* model, const char* tag, int* tokens, int count, int max_tokens) {
+    if (count >= max_tokens) return count;
+    int id = find_special_token(model, tag);
+    if (id >= 0) tokens[count++] = id;
+    return count;
+}
+
 /* BPE-style tokenize: greedy longest match against vocab */
-static int real_tokenize(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
+static int real_tokenize_raw(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
     int count = 0;
-    tokens[count++] = 1; /* BOS */
 
     if (!model->vocab_loaded || !model->vocab_tokens) {
-        /* Fallback: hash-based */
-        const char* p = text;
+        /* Fallback: byte-level encoding using low token IDs */
+        const unsigned char* p = (const unsigned char*)text;
         while (*p && count < max_tokens - 1) {
-            while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-            if (!*p) break;
-            const char* start = p;
-            while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
-            unsigned int hash = 5381;
-            for (const char* c = start; c < p; c++)
-                hash = ((hash << 5) + hash) + (unsigned char)*c;
-            tokens[count++] = 100 + (hash % (model->config.vocab_size - 200));
+            /* Use token IDs 3..258 for raw bytes (common in BPE vocabs) */
+            tokens[count++] = 3 + *p;
+            p++;
         }
-        if (count < max_tokens) tokens[count++] = 2;
         return count;
     }
 
-    /* Real tokenization: greedy longest-match against vocab
-       Optimization: only check tokens that start with the current character */
+    /* Normalize text: convert spaces to ▁ for SentencePiece matching */
+    int norm_sz = (int)strlen(text) * 4 + 16;
+    char* normalized = malloc(norm_sz);
+    sp_normalize(text, normalized, norm_sz);
+
     int vocab_size = model->config.vocab_size;
-    const char* p = text;
+    const char* p = normalized;
 
     while (*p && count < max_tokens - 1) {
         int best_len = 0;
-        int best_id = 3; /* unknown token */
-        unsigned char first_ch = (unsigned char)*p;
+        int best_id = -1;
 
-        /* Only check vocab entries that start with the same byte */
+        /* Greedy longest-match against vocabulary */
         for (int v = 0; v < vocab_size; v++) {
             const char* tok = model->vocab_tokens[v];
             if (!tok || tok[0] == '\0') continue;
-            if ((unsigned char)tok[0] != first_ch) {
-                /* Also check for ▁ prefix (0xE2) matching space */
-                if (first_ch == ' ' && (unsigned char)tok[0] == 0xE2) { /* might be ▁ */ }
-                else continue;
-            }
+
+            /* Quick first-byte filter */
+            if ((unsigned char)tok[0] != (unsigned char)*p) continue;
+
             int tlen = (int)strlen(tok);
             if (tlen > best_len && strncmp(p, tok, tlen) == 0) {
                 best_len = tlen;
@@ -170,20 +223,126 @@ static int real_tokenize(transformer_model_t* model, const char* text, int* toke
             }
         }
 
-        if (best_len > 0) {
+        if (best_len > 0 && best_id >= 0) {
             tokens[count++] = best_id;
             p += best_len;
         } else {
-            /* Single byte fallback — find the byte token */
-            for (int v = 0; v < vocab_size && v < 512; v++) {
+            /* Single byte fallback — try to find a byte token */
+            int found = 0;
+            unsigned char ch = (unsigned char)*p;
+            /* Search for single-char token matching this byte */
+            for (int v = 0; v < vocab_size; v++) {
                 const char* tok = model->vocab_tokens[v];
-                if (tok && strlen(tok) == 1 && tok[0] == *p) { tokens[count++] = v; break; }
+                if (tok && strlen(tok) == 1 && (unsigned char)tok[0] == ch) {
+                    tokens[count++] = v;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                /* Last resort: use byte value + 3 as token ID */
+                tokens[count++] = 3 + ch;
             }
             p++;
         }
     }
 
-    if (count < max_tokens) tokens[count++] = 2; /* EOS */
+    free(normalized);
+    return count;
+}
+
+/*
+ * Detect chat template style from vocabulary.
+ * Returns: 1=Llama3/Phi3 style, 2=ChatML style, 3=Llama2 style, 0=unknown
+ */
+static int detect_template(transformer_model_t* model) {
+    if (!model->vocab_loaded || !model->vocab_tokens) return 0;
+
+    /* Check for Llama 3 / Phi-3 style tokens */
+    if (find_special_token(model, "<|user|>") >= 0 ||
+        find_special_token(model, "<|start_header_id|>") >= 0)
+        return 1;
+
+    /* Check for ChatML style */
+    if (find_special_token(model, "<|im_start|>") >= 0)
+        return 2;
+
+    /* Check for Llama 2 style */
+    if (find_special_token(model, "[INST]") >= 0)
+        return 3;
+
+    return 0;
+}
+
+/*
+ * Full tokenization with chat template wrapping.
+ * Produces: BOS + template_header + user_message + template_footer
+ */
+static int real_tokenize(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
+    int count = 0;
+    tokens[count++] = 1; /* BOS */
+
+    int tmpl = detect_template(model);
+    fprintf(stderr, "[tokenize] template=%d\n", tmpl);
+
+    if (tmpl == 1) {
+        /* Llama 3 / Phi-3 style:
+         * <|user|>\n{message}<|end|>\n<|assistant|>\n
+         * OR: <|start_header_id|>user<|end_header_id|>\n{message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n
+         */
+        if (find_special_token(model, "<|user|>") >= 0) {
+            /* Phi-3 style */
+            count = append_special(model, "<|user|>", tokens, count, max_tokens);
+            /* Tokenize "\n" + message */
+            char* wrapped = malloc(strlen(text) + 4);
+            sprintf(wrapped, "\n%s", text);
+            count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
+            free(wrapped);
+            count = append_special(model, "<|end|>", tokens, count, max_tokens);
+            count = append_special(model, "<|assistant|>", tokens, count, max_tokens);
+        } else {
+            /* Llama 3 style */
+            count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
+            count += real_tokenize_raw(model, "user", tokens + count, max_tokens - count);
+            count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
+            char* wrapped = malloc(strlen(text) + 4);
+            sprintf(wrapped, "\n%s", text);
+            count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
+            free(wrapped);
+            count = append_special(model, "<|eot_id|>", tokens, count, max_tokens);
+            count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
+            count += real_tokenize_raw(model, "assistant", tokens + count, max_tokens - count);
+            count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
+        }
+    } else if (tmpl == 2) {
+        /* ChatML style:
+         * <|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n
+         */
+        count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
+        char* wrapped = malloc(strlen(text) + 16);
+        sprintf(wrapped, "user\n%s", text);
+        count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
+        free(wrapped);
+        count = append_special(model, "<|im_end|>", tokens, count, max_tokens);
+        count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
+        count += real_tokenize_raw(model, "assistant\n", tokens + count, max_tokens - count);
+    } else if (tmpl == 3) {
+        /* Llama 2 style:
+         * [INST] {message} [/INST]
+         */
+        int inst_id = find_special_token(model, "[INST]");
+        int inst_end_id = find_special_token(model, "[/INST]");
+        if (inst_id >= 0) tokens[count++] = inst_id;
+        char* wrapped = malloc(strlen(text) + 4);
+        sprintf(wrapped, " %s ", text);
+        count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
+        free(wrapped);
+        if (inst_end_id >= 0) tokens[count++] = inst_end_id;
+    } else {
+        /* No template detected — just tokenize the raw text */
+        count += real_tokenize_raw(model, text, tokens + count, max_tokens - count);
+    }
+
     return count;
 }
 
@@ -221,45 +380,191 @@ static int real_detokenize(transformer_model_t* model, const int* tokens, int nt
     return pos;
 }
 
+/* ── Sampling with temperature and top-k ───────────────────────────── */
+
+/* Simple xorshift RNG (no dependency on srand/rand state) */
+static uint32_t g_rng_state = 0;
+static uint32_t rng_next(void) {
+    if (g_rng_state == 0) g_rng_state = (uint32_t)time(NULL) ^ 0xDEADBEEF;
+    g_rng_state ^= g_rng_state << 13;
+    g_rng_state ^= g_rng_state >> 17;
+    g_rng_state ^= g_rng_state << 5;
+    return g_rng_state;
+}
+static float rng_float(void) { return (float)(rng_next() & 0xFFFFFF) / (float)0xFFFFFF; }
+
+/*
+ * Sample a token from logits with temperature, top-k, and repetition penalty.
+ *   temperature: 0 = greedy, >0 = random sampling
+ *   top_k: number of top candidates to sample from (0 = disabled)
+ *   rep_penalty: >1.0 penalizes recently generated tokens
+ *   recent_tokens/n_recent: window of recent tokens for repetition penalty
+ */
+static int sample_with_params(float* logits, int vocab,
+                              float temperature, int top_k,
+                              float rep_penalty,
+                              const int* recent_tokens, int n_recent) {
+    /* Apply repetition penalty */
+    if (rep_penalty > 1.0f && recent_tokens && n_recent > 0) {
+        for (int i = 0; i < n_recent; i++) {
+            int tid = recent_tokens[i];
+            if (tid >= 0 && tid < vocab) {
+                if (logits[tid] > 0)
+                    logits[tid] /= rep_penalty;
+                else
+                    logits[tid] *= rep_penalty;
+            }
+        }
+    }
+
+    /* Greedy if temperature is 0 or very small */
+    if (temperature < 0.01f) {
+        float best = logits[0]; int bid = 0;
+        for (int v = 1; v < vocab; v++)
+            if (logits[v] > best) { best = logits[v]; bid = v; }
+        return bid;
+    }
+
+    /* Apply temperature */
+    for (int v = 0; v < vocab; v++)
+        logits[v] /= temperature;
+
+    /* Top-K filtering: find top_k largest logits */
+    int k = (top_k > 0 && top_k < vocab) ? top_k : 40;
+    /* Simple partial sort: find the k-th largest value */
+    /* For efficiency, use a single pass to find the threshold */
+    float threshold = -1e30f;
+    if (k < vocab) {
+        /* Collect top-k values using a simple min-heap approach */
+        float* topk = (float*)malloc(k * sizeof(float));
+        for (int i = 0; i < k; i++) topk[i] = -1e30f;
+        float heap_min = -1e30f;
+        for (int v = 0; v < vocab; v++) {
+            if (logits[v] > heap_min) {
+                /* Find and replace the minimum in topk */
+                int min_idx = 0;
+                for (int j = 1; j < k; j++)
+                    if (topk[j] < topk[min_idx]) min_idx = j;
+                topk[min_idx] = logits[v];
+                /* Update heap_min */
+                heap_min = topk[0];
+                for (int j = 1; j < k; j++)
+                    if (topk[j] < heap_min) heap_min = topk[j];
+            }
+        }
+        threshold = heap_min;
+        free(topk);
+    }
+
+    /* Softmax over candidates above threshold */
+    float max_val = -1e30f;
+    for (int v = 0; v < vocab; v++) {
+        if (logits[v] >= threshold && logits[v] > max_val)
+            max_val = logits[v];
+    }
+
+    float sum = 0.0f;
+    for (int v = 0; v < vocab; v++) {
+        if (logits[v] >= threshold) {
+            logits[v] = expf(logits[v] - max_val);
+            sum += logits[v];
+        } else {
+            logits[v] = 0.0f;
+        }
+    }
+
+    if (sum <= 0.0f) {
+        /* Fallback to greedy */
+        float best = logits[0]; int bid = 0;
+        for (int v = 1; v < vocab; v++)
+            if (logits[v] > best) { best = logits[v]; bid = v; }
+        return bid;
+    }
+
+    /* Normalize */
+    for (int v = 0; v < vocab; v++)
+        logits[v] /= sum;
+
+    /* Random sample */
+    float r = rng_float();
+    float cumsum = 0.0f;
+    for (int v = 0; v < vocab; v++) {
+        cumsum += logits[v];
+        if (cumsum >= r) return v;
+    }
+    return vocab - 1; /* shouldn't reach here */
+}
+
 /* ── Generate with real tokenizer ─────────────────────────────────── */
+
+/* Global chat parameters (set from handle_cmd) */
+static float g_temperature = 0.7f;
+static int   g_top_k = 40;
+static float g_rep_penalty = 1.1f;
 
 static void run_chat(transformer_model_t* model, const char* user_msg, int ntok, char* out, int osz) {
     int vocab = model->config.vocab_size;
-    fprintf(stderr, "[run_chat] vocab=%d msg='%s' ntok=%d\n", vocab, user_msg, ntok);
+    fprintf(stderr, "[run_chat] vocab=%d msg='%s' ntok=%d temp=%.2f\n", vocab, user_msg, ntok, g_temperature);
     fflush(stderr);
 
     float* logits = (float*)aligned_malloc(vocab * sizeof(float), 64);
-    int* ctx = (int*)malloc(2048 * sizeof(int));
+    int* ctx = (int*)malloc(4096 * sizeof(int));
     int ctx_len = 0;
 
-    /* Tokenize user message with real vocab */
+    /* Tokenize user message with chat template */
     fprintf(stderr, "[run_chat] tokenizing...\n"); fflush(stderr);
-    ctx_len = real_tokenize(model, user_msg, ctx, 512);
-    fprintf(stderr, "[run_chat] tokenized: %d tokens\n", ctx_len); fflush(stderr);
+    ctx_len = real_tokenize(model, user_msg, ctx, 1024);
+    fprintf(stderr, "[run_chat] tokenized: %d tokens, first few:", ctx_len);
+    for (int i = 0; i < ctx_len && i < 10; i++) fprintf(stderr, " %d", ctx[i]);
+    fprintf(stderr, "\n"); fflush(stderr);
 
     double start = cli_time_sec();
     int gen = 0;
     int out_tokens[512];
+
+    /* Detect EOS tokens for this model */
+    int eos_ids[8] = {2, -1, -1, -1, -1, -1, -1, -1};
+    int n_eos = 1;
+    /* Common EOS/stop tokens */
+    const char* eos_names[] = {
+        "<|end|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>",
+        "</s>", "<|end_of_text|>", NULL
+    };
+    for (int i = 0; eos_names[i] && n_eos < 8; i++) {
+        int id = find_special_token(model, eos_names[i]);
+        if (id >= 0) eos_ids[n_eos++] = id;
+    }
 
     for (int t = 0; t < ntok; t++) {
         int next = 0;
         fprintf(stderr, "[run_chat] forward pass %d/%d ctx_len=%d...\n", t+1, ntok, ctx_len); fflush(stderr);
         model_forward(model, ctx, ctx_len, logits, &next);
 
-        /* Greedy argmax */
-        float best = logits[0]; int bid = 0;
-        for (int v = 1; v < vocab; v++)
-            if (logits[v] > best) { best = logits[v]; bid = v; }
-        next = bid;
+        /* Sample with temperature, top-k, and repetition penalty */
+        next = sample_with_params(logits, vocab,
+                                  g_temperature, g_top_k, g_rep_penalty,
+                                  out_tokens, gen);
 
-        if (ctx_len < 2048) ctx[ctx_len++] = next;
+        if (ctx_len < 4096) ctx[ctx_len++] = next;
         else { memmove(ctx, ctx+64, (ctx_len-64)*sizeof(int)); ctx_len -= 64; ctx[ctx_len++] = next; }
 
         out_tokens[gen] = next;
         gen++;
-        /* Stop on EOS (2), or if model is stuck generating same token */
-        if (next == 2) break;
-        if (gen >= 3 && out_tokens[gen-1] == out_tokens[gen-2] && out_tokens[gen-2] == out_tokens[gen-3]) break;
+
+        /* Stop on any EOS token */
+        int is_eos = 0;
+        for (int e = 0; e < n_eos; e++) {
+            if (next == eos_ids[e]) { is_eos = 1; break; }
+        }
+        if (is_eos) break;
+
+        /* Stop if stuck repeating the same token 5 times */
+        if (gen >= 5) {
+            int all_same = 1;
+            for (int r = 1; r < 5; r++)
+                if (out_tokens[gen-1-r] != out_tokens[gen-1]) { all_same = 0; break; }
+            if (all_same) break;
+        }
     }
 
     double elapsed = cli_time_sec() - start;
@@ -268,7 +573,7 @@ static void run_chat(transformer_model_t* model, const char* user_msg, int ntok,
     fflush(stderr);
 
     /* Detokenize the generated tokens */
-    char text_out[2048] = {0};
+    char text_out[4096] = {0};
     real_detokenize(model, out_tokens, gen, text_out, sizeof(text_out));
 
     int pos = 0;
@@ -325,16 +630,40 @@ static void handle_cmd(const char* raw, char* resp, int rsz) {
     }
     else if (strncmp(cmd, "chat ", 5) == 0) {
         if (!g_model) { snprintf(resp, rsz, "No model loaded.\n"); return; }
-        /* Format: "chat <max_tokens> <user message>" */
+        /* Format: "chat <max_tokens> <user message>"
+         * Or:     "chat <max_tokens> <temp> <top_k> <rep_penalty> <user message>"
+         */
         const char* rest = cmd + 5;
         int n = 256;
-        /* Try to parse token count */
         char* endp = NULL;
         long val = strtol(rest, &endp, 10);
         const char* msg = rest;
         if (endp && endp != rest && *endp == ' ') {
             n = (int)val;
             msg = endp + 1;
+
+            /* Try to parse optional temp, top_k, rep_penalty */
+            float temp = 0;
+            long tk = 0;
+            float rp = 0;
+            char* endp2 = NULL;
+            temp = strtof(msg, &endp2);
+            if (endp2 && endp2 != msg && *endp2 == ' ') {
+                msg = endp2 + 1;
+                char* endp3 = NULL;
+                tk = strtol(msg, &endp3, 10);
+                if (endp3 && endp3 != msg && *endp3 == ' ') {
+                    msg = endp3 + 1;
+                    char* endp4 = NULL;
+                    rp = strtof(msg, &endp4);
+                    if (endp4 && endp4 != msg && *endp4 == ' ') {
+                        msg = endp4 + 1;
+                        g_temperature = temp;
+                        g_top_k = (int)tk;
+                        g_rep_penalty = rp;
+                    }
+                }
+            }
         }
         if (n < 1)
             n = 1;

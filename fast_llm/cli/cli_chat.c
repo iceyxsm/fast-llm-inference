@@ -546,9 +546,12 @@ void chat_run(chat_config_t* cfg) {
             continue;
         }
 
-        /* Send user message to daemon */
+        /* Send user message to daemon with sampling parameters */
         char cmd[2048];
-        snprintf(cmd, sizeof(cmd), "chat %d %s", cfg->max_tokens, input);
+        snprintf(cmd, sizeof(cmd), "chat %d %.2f %d %.2f %s",
+                 cfg->max_tokens, cfg->temperature, cfg->top_k,
+                 cfg->repeat_penalty_on ? cfg->repeat_penalty : 1.0f,
+                 input);
 
         char resp[4096]={0};
         printf("\n  ");
