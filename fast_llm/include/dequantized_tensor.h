@@ -27,6 +27,7 @@ extern "C" {
 typedef struct {
     int8_t* weights;       /* [rows, cols] int8 weights, row-major */
     float*  scales;        /* [rows] per-row scales */
+    float*  f32_weights;   /* [rows, cols] float32 weights (if available) */
     int     rows;
     int     cols;
     /* Original quantization info for reference */

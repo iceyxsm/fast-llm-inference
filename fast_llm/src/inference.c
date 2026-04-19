@@ -127,9 +127,75 @@ static void matmul_float(const float* A, const float* B, float* C,
     }
 }
 
-/* Attention computation: Q @ K^T / sqrt(d_k) */
-static void compute_attention(const float* Q, const float* K, const float* V,
+/* Matrix-vector multiply using dequantized tensor (supports f32 or int8 weights) */
+static void matvec(const float* input, const dequantized_tensor_t* W, float* output, int out_dim, int in_dim) {
+    if (W->f32_weights) {
+        /* Use float32 weights directly — full precision */
+        for (int o = 0; o < out_dim; o++) {
+            float sum = 0.0f;
+            const float* row = W->f32_weights + o * in_dim;
+            for (int i = 0; i < in_dim; i++) {
+                sum += input[i] * row[i];
+            }
+            output[o] = sum;
+        }
+    } else if (W->weights && W->scales) {
+        /* Use int8 weights with per-row scale */
+        for (int o = 0; o < out_dim; o++) {
+            float sum = 0.0f;
+            const int8_t* row = W->weights + o * in_dim;
+            float scale = W->scales[o];
+            for (int i = 0; i < in_dim; i++) {
+                sum += input[i] * row[i];
+            }
+            output[o] = sum * scale;
+        }
+    } else {
+        memset(output, 0, out_dim * sizeof(float));
+    }
+}
+
+/* Apply Rotary Position Embeddings (RoPE) to Q and K */
+static void apply_rope(float* q, float* k, int seq_len, int num_heads, int num_kv_heads, int head_dim, float rope_theta) {
+    /* RoPE: for each position, rotate pairs of dimensions */
+    /* freq_i = 1 / (theta ^ (2i / head_dim)) */
+    for (int pos = 0; pos < seq_len; pos++) {
+        for (int h = 0; h < num_heads; h++) {
+            float* q_vec = q + pos * num_heads * head_dim + h * head_dim;
+            for (int i = 0; i < head_dim; i += 2) {
+                float freq = 1.0f / powf(rope_theta, (float)i / (float)head_dim);
+                float angle = pos * freq;
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float q0 = q_vec[i];
+                float q1 = q_vec[i + 1];
+                q_vec[i]     = q0 * cos_a - q1 * sin_a;
+                q_vec[i + 1] = q0 * sin_a + q1 * cos_a;
+            }
+        }
+        for (int h = 0; h < num_kv_heads; h++) {
+            float* k_vec = k + pos * num_kv_heads * head_dim + h * head_dim;
+            for (int i = 0; i < head_dim; i += 2) {
+                float freq = 1.0f / powf(rope_theta, (float)i / (float)head_dim);
+                float angle = pos * freq;
+                float cos_a = cosf(angle);
+                float sin_a = sinf(angle);
+                float k0 = k_vec[i];
+                float k1 = k_vec[i + 1];
+                k_vec[i]     = k0 * cos_a - k1 * sin_a;
+                k_vec[i + 1] = k0 * sin_a + k1 * cos_a;
+            }
+        }
+    }
+}
+
+/* Attention computation: RoPE + Q @ K^T / sqrt(d_k) + softmax + V */
+static void compute_attention(float* Q, float* K, const float* V,
                               float* output, int seq_len, int num_heads, int num_kv_heads, int head_dim) {
+    /* Apply RoPE to Q and K */
+    float rope_theta = 500000.0f; /* Llama 3.x uses 500000, older models use 10000 */
+    apply_rope(Q, K, seq_len, num_heads, num_kv_heads, head_dim, rope_theta);
+
     float scale = 1.0f / sqrtf((float)head_dim);
     int kv_group = num_heads / num_kv_heads; /* how many Q heads per KV head */
     
@@ -218,55 +284,19 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
         float* k_row = &k[s * kv_dim];
         float* v_row = &v[s * kv_dim];
         
-        /* Q projection: [hidden] @ [hidden, hidden] -> [hidden] */
+        /* Q projection: [hidden] -> [hidden] */
         if (model->q_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(norm_row, model->q_proj[layer_idx], q_row, 1, hidden_size, hidden_size);
-            #else
-            for (int h = 0; h < hidden_size; h++) {
-                float sum = 0.0f;
-                const int8_t* w = model->q_proj[layer_idx]->weights;
-                float scale = model->q_proj[layer_idx]->scales[h];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
-                }
-                q_row[h] = sum;
-            }
-            #endif
+            matvec(norm_row, model->q_proj[layer_idx], q_row, hidden_size, hidden_size);
         }
         
-        /* K projection: [hidden] @ [kv_dim, hidden] -> [kv_dim] */
+        /* K projection: [hidden] -> [kv_dim] */
         if (model->k_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(norm_row, model->k_proj[layer_idx], k_row, 1, kv_dim, hidden_size);
-            #else
-            for (int h = 0; h < kv_dim; h++) {
-                float sum = 0.0f;
-                const int8_t* w = model->k_proj[layer_idx]->weights;
-                float scale = model->k_proj[layer_idx]->scales[h];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
-                }
-                k_row[h] = sum;
-            }
-            #endif
+            matvec(norm_row, model->k_proj[layer_idx], k_row, kv_dim, hidden_size);
         }
         
-        /* V projection: [hidden] @ [kv_dim, hidden] -> [kv_dim] */
+        /* V projection: [hidden] -> [kv_dim] */
         if (model->v_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(norm_row, model->v_proj[layer_idx], v_row, 1, kv_dim, hidden_size);
-            #else
-            for (int h = 0; h < kv_dim; h++) {
-                float sum = 0.0f;
-                const int8_t* w = model->v_proj[layer_idx]->weights;
-                float scale = model->v_proj[layer_idx]->scales[h];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += norm_row[d] * w[h * hidden_size + d] * scale;
-                }
-                v_row[h] = sum;
-            }
-            #endif
+            matvec(norm_row, model->v_proj[layer_idx], v_row, kv_dim, hidden_size);
         }
     }
     
@@ -280,25 +310,11 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
         float* res_row = &residual[s * hidden_size];
         
         if (model->o_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            /* Compute O projection: [hidden] @ [hidden, hidden] -> [hidden] */
-            float o_out[4096]; /* Max hidden size */
-            matmul_dequantized_asm_style(attn_row, model->o_proj[layer_idx], o_out, 1, hidden_size, hidden_size);
-            /* Add residual */
-            for (int h = 0; h < hidden_size; h++) {
+            float* o_out = aligned_malloc(hidden_size * sizeof(float), 32);
+            matvec(attn_row, model->o_proj[layer_idx], o_out, hidden_size, hidden_size);
+            for (int h = 0; h < hidden_size; h++)
                 out_row[h] = res_row[h] + o_out[h];
-            }
-            #else
-            for (int h = 0; h < hidden_size; h++) {
-                float sum = 0.0f;
-                const int8_t* w = model->o_proj[layer_idx]->weights;
-                float scale = model->o_proj[layer_idx]->scales[h];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += attn_row[d] * w[h * hidden_size + d] * scale;
-                }
-                out_row[h] = res_row[h] + sum;
-            }
-            #endif
+            aligned_free(o_out);
         } else {
             for (int h = 0; h < hidden_size; h++) {
                 out_row[h] = res_row[h];
@@ -321,39 +337,14 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
         float* gate_row = &gate[s * intermediate_size];
         float* up_row = &up[s * intermediate_size];
         
-        /* Gate projection (SiLU) */
+        /* Gate projection */
         if (model->gate_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(ff_row, model->gate_proj[layer_idx], gate_row, 1, intermediate_size, hidden_size);
-            /* SiLU will be applied in fused SwiGLU below */
-            #else
-            for (int i = 0; i < intermediate_size; i++) {
-                float sum = 0.0f;
-                const int8_t* w = model->gate_proj[layer_idx]->weights;
-                float scale = model->gate_proj[layer_idx]->scales[i];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += ff_row[d] * w[i * hidden_size + d] * scale;
-                }
-                gate_row[i] = silu(sum);
-            }
-            #endif
+            matvec(ff_row, model->gate_proj[layer_idx], gate_row, intermediate_size, hidden_size);
         }
         
         /* Up projection */
         if (model->up_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            matmul_dequantized_asm_style(ff_row, model->up_proj[layer_idx], up_row, 1, intermediate_size, hidden_size);
-            #else
-            for (int i = 0; i < intermediate_size; i++) {
-                float sum = 0.0f;
-                const int8_t* w = model->up_proj[layer_idx]->weights;
-                float scale = model->up_proj[layer_idx]->scales[i];
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += ff_row[d] * w[i * hidden_size + d] * scale;
-                }
-                up_row[i] = sum;
-            }
-            #endif
+            matvec(ff_row, model->up_proj[layer_idx], up_row, intermediate_size, hidden_size);
         }
         
         /* SwiGLU: fused SiLU(gate) * up using AVX2 */
@@ -373,25 +364,11 @@ static void transformer_layer(transformer_model_t* model, int layer_idx,
         float* res_row = &residual[s * hidden_size];
         
         if (model->down_proj[layer_idx]) {
-            #if USE_OPTIMIZED_MATMUL
-            /* Compute down projection: [intermediate] @ [hidden, intermediate] -> [hidden] */
-            float down_out[4096]; /* Max hidden size */
-            matmul_dequantized_asm_style(gate_row, model->down_proj[layer_idx], down_out, 1, hidden_size, intermediate_size);
-            /* Add residual */
-            for (int h = 0; h < hidden_size; h++) {
+            float* down_out = aligned_malloc(hidden_size * sizeof(float), 32);
+            matvec(gate_row, model->down_proj[layer_idx], down_out, hidden_size, intermediate_size);
+            for (int h = 0; h < hidden_size; h++)
                 out_row[h] = res_row[h] + down_out[h];
-            }
-            #else
-            for (int h = 0; h < hidden_size; h++) {
-                float sum = 0.0f;
-                const int8_t* w = model->down_proj[layer_idx]->weights;
-                float scale = model->down_proj[layer_idx]->scales[h];
-                for (int i = 0; i < intermediate_size; i++) {
-                    sum += gate_row[i] * w[h * intermediate_size + i] * scale;
-                }
-                out_row[h] = res_row[h] + sum;
-            }
-            #endif
+            aligned_free(down_out);
         } else {
             for (int h = 0; h < hidden_size; h++) {
                 out_row[h] = res_row[h];
@@ -470,25 +447,7 @@ void model_forward(transformer_model_t* model,
     float* last_hidden = &normed[(seq_len - 1) * hidden_size];
     
     if (model->lm_head) {
-        /* Check LM head weights */
-        float lm_sample = model->lm_head->weights[0] * model->lm_head->scales[0];
-        fprintf(stderr, "[fwd] LM head: rows=%d cols=%d w[0]=%d s[0]=%.6f val=%.6f\n",
-            model->lm_head->rows, model->lm_head->cols,
-            model->lm_head->weights[0], model->lm_head->scales[0], lm_sample);
-        fflush(stderr);
-        #if USE_OPTIMIZED_MATMUL
-        matmul_dequantized_asm_style(last_hidden, model->lm_head, logits, 1, vocab_size, hidden_size);
-        #else
-        for (int v = 0; v < vocab_size; v++) {
-            float sum = 0.0f;
-            const int8_t* w = model->lm_head->weights;
-            float scale = model->lm_head->scales[v];
-            for (int d = 0; d < hidden_size; d++) {
-                sum += last_hidden[d] * w[v * hidden_size + d] * scale;
-            }
-            logits[v] = sum;
-        }
-        #endif
+        matvec(last_hidden, model->lm_head, logits, vocab_size, hidden_size);
     } else {
         memset(logits, 0, vocab_size * sizeof(float));
     }

@@ -505,19 +505,21 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     /* Allocate token embeddings */
     model->token_embeddings = aligned_malloc(config.vocab_size * config.hidden_size * sizeof(float), 64);
     
-    /* Allocate LM head */
-    model->lm_head = malloc(sizeof(dequantized_tensor_t));
+    /* Allocate LM head (minimal — will be filled during tensor loading or tied) */
+    model->lm_head = calloc(1, sizeof(dequantized_tensor_t));
     model->lm_head->rows = config.vocab_size;
     model->lm_head->cols = config.hidden_size;
-    model->lm_head->weights = aligned_malloc(config.vocab_size * config.hidden_size, 64);
-    model->lm_head->scales = aligned_malloc(config.vocab_size * sizeof(float), 64);
+    /* Don't pre-allocate weights — they'll be set during loading or tied */
     
-    /* KV cache */
-    size_t kv_size = (size_t)config.num_layers * config.max_seq_len * 
+    /* KV cache — use reasonable max context, not the model's theoretical max */
+    int actual_max_seq = config.max_seq_len;
+    if (actual_max_seq > 4096) actual_max_seq = 4096; /* Cap at 4K for memory */
+    size_t kv_size = (size_t)config.num_layers * actual_max_seq * 
                      config.num_kv_heads * config.head_dim * sizeof(float);
     model->k_cache = aligned_malloc(kv_size, 64);
     model->v_cache = aligned_malloc(kv_size, 64);
-    memset(model->k_cache, 0, kv_size);
+    if (model->k_cache) memset(model->k_cache, 0, kv_size);
+    if (model->v_cache) memset(model->v_cache, 0, kv_size);
     memset(model->v_cache, 0, kv_size);
     
     /* Track loading stats */
@@ -564,7 +566,46 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
         int cols = (tensors[i].n_dims > 1) ? tensors[i].dims[1] : 1;
         
         /* Dequantize and store based on type */
-        if (tensors[i].type == GGML_TYPE_Q4_0 || 
+        if ((tensors[i].type == GGML_TYPE_Q4_0 || 
+            tensors[i].type == GGML_TYPE_Q4_K ||
+            tensors[i].type == GGML_TYPE_Q4_1 ||
+            tensors[i].type == GGML_TYPE_Q5_K ||
+            tensors[i].type == GGML_TYPE_Q6_K) && proj_type == PROJ_EMBED) {
+            /* Special handling for embeddings: dequantize row by row to avoid 1GB allocation */
+            /* GGUF stores as [hidden_size, vocab_size], we need [vocab_size, hidden_size] */
+            int emb_hidden = rows;  /* 2048 */
+            int emb_vocab = cols;   /* 128256 */
+            if (emb_hidden > config.hidden_size) emb_hidden = config.hidden_size;
+            if (emb_vocab > config.vocab_size) emb_vocab = config.vocab_size;
+
+            /* Dequantize one row at a time (one row = one hidden dim across all vocab) */
+            float* row_buf = aligned_malloc(emb_vocab * sizeof(float), 64);
+            int block_size = 256;
+            int blocks_per_row = emb_vocab / block_size;
+
+            for (int h = 0; h < emb_hidden; h++) {
+                /* Dequantize row h: block_size elements at a time */
+                const uint8_t* row_data = (const uint8_t*)tensor_data + h * (tensors[i].size / rows);
+                if (tensors[i].type == GGML_TYPE_Q6_K) {
+                    dequantize_q6_K(row_data, row_buf, emb_vocab);
+                } else if (tensors[i].type == GGML_TYPE_Q5_K) {
+                    dequantize_q5_K(row_data, row_buf, emb_vocab);
+                } else if (tensors[i].type == GGML_TYPE_Q4_K) {
+                    dequantize_q4_K(row_data, row_buf, emb_vocab);
+                } else if (tensors[i].type == GGML_TYPE_Q4_0) {
+                    dequantize_q4_0(row_data, row_buf, emb_vocab);
+                }
+                /* Transpose: row h of [hidden, vocab] → column h of [vocab, hidden] */
+                for (int v = 0; v < emb_vocab; v++) {
+                    model->token_embeddings[v * config.hidden_size + h] = row_buf[v];
+                }
+            }
+            aligned_free(row_buf);
+            loaded_tensors++;
+            total_bytes += rows * cols * 2;
+            printf("  [Embed loaded via row-by-row dequant+transpose]\n");
+        }
+        else if (tensors[i].type == GGML_TYPE_Q4_0 || 
             tensors[i].type == GGML_TYPE_Q4_K ||
             tensors[i].type == GGML_TYPE_Q4_1 ||
             tensors[i].type == GGML_TYPE_Q5_K ||
@@ -620,27 +661,13 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
             dt->rows = out_dim;
             dt->cols = in_dim;
-            dt->weights = aligned_malloc(out_dim * in_dim, 64);
-            dt->scales = aligned_malloc(out_dim * sizeof(float), 64);
-            
-            /* Quantize to int8 per row */
-            for (int r = 0; r < out_dim; r++) {
-                float max_abs = 0.0f;
-                for (int c = 0; c < in_dim; c++) {
-                    float v = fabsf(f32_data[r * in_dim + c]);
-                    if (v > max_abs) max_abs = v;
-                }
-                
-                dt->scales[r] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
-                float inv_scale = 1.0f / dt->scales[r];
-                
-                for (int c = 0; c < in_dim; c++) {
-                    float scaled = f32_data[r * in_dim + c] * inv_scale;
-                    if (scaled > 127) scaled = 127;
-                    if (scaled < -128) scaled = -128;
-                    dt->weights[r * in_dim + c] = (int8_t)roundf(scaled);
-                }
-            }
+            dt->weights = NULL;  /* not using int8 */
+            dt->scales = NULL;
+            dt->f32_weights = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
+            dt->original_bits = 0;
+
+            /* Store float32 weights directly — no int8 re-quantization */
+            memcpy(dt->f32_weights, f32_data, out_dim * in_dim * sizeof(float));
             
             aligned_free(f32_data);
             
@@ -846,24 +873,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
                 dt->rows = out_dim;
                 dt->cols = in_dim;
-                dt->weights = aligned_malloc(out_dim * in_dim, 64);
-                dt->scales = aligned_malloc(out_dim * sizeof(float), 64);
+                dt->weights = NULL;
+                dt->scales = NULL;
+                dt->f32_weights = aligned_malloc(out_dim * in_dim * sizeof(float), 64);
+                dt->original_bits = 0;
+                memcpy(dt->f32_weights, f32_data, out_dim * in_dim * sizeof(float));
 
-                for (int r = 0; r < out_dim; r++) {
-                    float max_abs = 0.0f;
-                    for (int c = 0; c < in_dim; c++) {
-                        float v = fabsf(f32_data[r * in_dim + c]);
-                        if (v > max_abs) max_abs = v;
-                    }
-                    dt->scales[r] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
-                    float inv_scale = 1.0f / dt->scales[r];
-                    for (int c = 0; c < in_dim; c++) {
-                        float scaled = f32_data[r * in_dim + c] * inv_scale;
-                        if (scaled > 127) scaled = 127;
-                        if (scaled < -128) scaled = -128;
-                        dt->weights[r * in_dim + c] = (int8_t)roundf(scaled);
-                    }
-                }
                 aligned_free(f32_data);
 
                 /* Store in appropriate slot */
@@ -918,25 +933,13 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
     printf("\nLoaded: %d tensors (%zu MB)\n", loaded_tensors, total_bytes / (1024*1024));
     printf("Skipped: %d tensors\n", skipped_tensors);
 
-    /* Handle tied embeddings: if LM head is all zeros, copy from token embeddings */
-    if (model->lm_head && model->lm_head->weights[0] == 0 && model->lm_head->scales[0] == 0.0f) {
+    /* Handle tied embeddings: if LM head has no weights, use token embeddings */
+    if (model->lm_head && !model->lm_head->f32_weights && !model->lm_head->weights) {
         printf("  LM head empty — using tied embeddings\n");
-        /* The LM head should be [vocab_size, hidden_size] same as embeddings */
-        for (int v = 0; v < config.vocab_size; v++) {
-            float max_abs = 0.0f;
-            for (int h = 0; h < config.hidden_size; h++) {
-                float val = fabsf(model->token_embeddings[v * config.hidden_size + h]);
-                if (val > max_abs) max_abs = val;
-            }
-            model->lm_head->scales[v] = max_abs > 0 ? max_abs / 127.0f : 1.0f;
-            float inv_scale = 1.0f / model->lm_head->scales[v];
-            for (int h = 0; h < config.hidden_size; h++) {
-                float scaled = model->token_embeddings[v * config.hidden_size + h] * inv_scale;
-                if (scaled > 127) scaled = 127;
-                if (scaled < -128) scaled = -128;
-                model->lm_head->weights[v * config.hidden_size + h] = (int8_t)roundf(scaled);
-            }
-        }
+        model->lm_head->f32_weights = model->token_embeddings; /* shared pointer */
+        model->lm_head->original_bits = -1; /* marker: don't free f32_weights */
+        model->lm_head->rows = config.vocab_size;
+        model->lm_head->cols = config.hidden_size;
     }
     if (skipped_tensors > 100) {
         printf("WARNING: Most tensors were skipped!\n");

@@ -85,8 +85,9 @@ dequantized_tensor_t* dequantized_from_q8(const quantized_tensor_t* q8_tensor) {
 
 void dequantized_tensor_free(dequantized_tensor_t* tensor) {
     if (tensor) {
-        aligned_free(tensor->weights);
-        aligned_free(tensor->scales);
+        if (tensor->weights) aligned_free(tensor->weights);
+        if (tensor->scales) aligned_free(tensor->scales);
+        if (tensor->f32_weights && tensor->original_bits != -1) aligned_free(tensor->f32_weights);
         free(tensor);
     }
 }
