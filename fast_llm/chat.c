@@ -1,10 +1,8 @@
 /*
  * Interactive Chat with REAL Inference
  * 
- * This connects to the actual backend:
- * - Real model loading from GGUF
- * - Real transformer forward pass
- * - Real token generation via model_forward()
+ * Uses the model's own vocabulary from GGUF for tokenization/detokenization.
+ * Applies proper chat templates based on the model architecture.
  */
 
 #include <stdio.h>
@@ -12,7 +10,7 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
-#include <ctype.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -31,388 +29,323 @@
 extern void model_forward(transformer_model_t* model,
                           const int* input_tokens, int seq_len,
                           float* output_logits, int* output_tokens);
-extern int g_max_layers;  /* Layer reduction setting */
+extern int g_max_layers;
 
-/* External model loading */
-transformer_model_t* model_load_gguf(const char* path, int use_int8);
-void model_free(transformer_model_t* model);
-void model_print_info(const transformer_model_t* model);
+/* ── SentencePiece-aware tokenizer ────────────────────────────────── */
 
-/* Simple vocabulary for basic tokenization */
-#define VOCAB_SIZE 32000
-static char* vocab[VOCAB_SIZE];
-static int vocab_loaded = 0;
+#define SP_SPACE "\xE2\x96\x81"
+#define SP_SPACE_LEN 3
 
-/* Initialize simple vocabulary */
-void init_vocab(void) {
-    if (vocab_loaded) return;
-    
-    /* Common words */
-    const char* common_words[] = {
-        "<pad>", "<s>", "</s>", "<unk>",
-        "the", "a", "an", "is", "are", "was", "were", "be", "been",
-        "have", "has", "had", "do", "does", "did", "will", "would",
-        "I", "you", "he", "she", "it", "we", "they",
-        "my", "your", "his", "her", "its", "our", "their",
-        "this", "that", "these", "those",
-        "and", "or", "but", "if", "then", "else", "when", "where",
-        "in", "on", "at", "to", "for", "of", "with", "by", "from",
-        "hello", "hi", "hey", "goodbye", "bye",
-        "yes", "no", "maybe", "sure", "ok",
-        "what", "who", "which", "how",
-        "can", "may", "might", "must",
-        "not", "very", "really", "just", "only",
-        "good", "bad", "great", "nice", "fine", "well",
-        "new", "old", "big", "small", "large", "little",
-        "time", "day", "way", "year", "work", "life", "world",
-        "know", "think", "see", "get", "make", "go", "come", "take",
-        "use", "find", "give", "tell", "ask", "feel", "try",
-        "AI", "machine", "learning", "model", "data", "computer",
-        "system", "program", "code", "software",
-        "human", "person", "people", "man", "woman", "child",
-        NULL
-    };
-    
-    int i = 0;
-    while (common_words[i] != NULL && i < VOCAB_SIZE) {
-        vocab[i] = strdup(common_words[i]);
-        i++;
-    }
-    
-    /* Fill rest with generic tokens */
-    char buf[32];
-    for (; i < VOCAB_SIZE; i++) {
-        snprintf(buf, sizeof(buf), "<tok%d>", i);
-        vocab[i] = strdup(buf);
-    }
-    
-    vocab_loaded = 1;
-}
-
-/* Simple word-based tokenization */
-int tokenize(const char* text, int* tokens, int max_tokens) {
-    if (!vocab_loaded) init_vocab();
-    
-    char buffer[1024];
-    strncpy(buffer, text, sizeof(buffer)-1);
-    buffer[sizeof(buffer)-1] = '\0';
-    
-    int count = 0;
-    char* p = buffer;
-    
-    /* Add BOS token */
-    tokens[count++] = 1;
-    
-    while (*p && count < max_tokens - 1) {
-        /* Skip whitespace */
-        while (*p && (*p == ' ' || *p == '\t' || *p == '\n')) p++;
-        if (!*p) break;
-        
-        /* Find word */
-        char* start = p;
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n') p++;
-        
-        char word[64] = {0};
-        int len = p - start;
-        if (len > 63) len = 63;
-        strncpy(word, start, len);
-        
-        /* Simple hash-based token lookup */
-        unsigned int hash = 0;
-        for (int j = 0; word[j]; j++) {
-            hash = hash * 31 + tolower(word[j]);
-        }
-        tokens[count++] = 1000 + (hash % 1000);
-    }
-    
-    /* Add EOS */
-    if (count < max_tokens) tokens[count++] = 2;
-    
-    return count;
-}
-
-/* Detokenize - convert tokens to text */
-int detokenize(int* tokens, int num_tokens, char* output, int max_len) {
-    if (!vocab_loaded) init_vocab();
-    
-    output[0] = '\0';
+/* Convert raw text to SentencePiece form: spaces become ▁ */
+static int sp_normalize(const char* text, char* out, int osz) {
     int pos = 0;
-    
-    for (int i = 0; i < num_tokens && pos < max_len - 1; i++) {
-        int tok = tokens[i];
-        const char* word = NULL;
-        
-        /* Look up in vocab */
-        if (tok >= 0 && tok < VOCAB_SIZE && vocab[tok]) {
-            word = vocab[tok];
-        }
-        
-        /* Skip special tokens */
-        if (!word || strcmp(word, "<s>") == 0 || strcmp(word, "</s>") == 0 
-            || strcmp(word, "<pad>") == 0 || strncmp(word, "<tok", 4) == 0) {
-            continue;
-        }
-        
-        /* Add space before word */
-        if (pos > 0 && word[0] != '.' && word[0] != ',' && word[0] != '!') {
-            output[pos++] = ' ';
-        }
-        
-        int word_len = strlen(word);
-        if (pos + word_len >= max_len - 1) word_len = max_len - pos - 1;
-        strncpy(output + pos, word, word_len);
-        pos += word_len;
-        output[pos] = '\0';
+    const char* p = text;
+    if (*p && *p != ' ') {
+        if (pos + SP_SPACE_LEN < osz) { memcpy(out + pos, SP_SPACE, SP_SPACE_LEN); pos += SP_SPACE_LEN; }
     }
-    
+    while (*p && pos < osz - 4) {
+        if (*p == ' ') { memcpy(out + pos, SP_SPACE, SP_SPACE_LEN); pos += SP_SPACE_LEN; p++; }
+        else { out[pos++] = *p++; }
+    }
+    out[pos] = '\0';
     return pos;
 }
 
-/* REAL generate function using actual model_forward() */
-int generate_real(transformer_model_t* model, int* prompt_tokens, int num_prompt,
-                  int* output_tokens, int max_output, float temperature) {
-    
+static int find_special_token(transformer_model_t* model, const char* text) {
+    if (!model->vocab_loaded || !model->vocab_tokens) return -1;
+    for (int v = 0; v < model->config.vocab_size; v++) {
+        const char* tok = model->vocab_tokens[v];
+        if (tok && strcmp(tok, text) == 0) return v;
+    }
+    return -1;
+}
+
+static int append_special(transformer_model_t* model, const char* tag, int* tokens, int count, int max) {
+    if (count >= max) return count;
+    int id = find_special_token(model, tag);
+    if (id >= 0) tokens[count++] = id;
+    return count;
+}
+
+/* Greedy longest-match tokenization on normalized text */
+static int tokenize_raw(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
+    int count = 0;
+    if (!model->vocab_loaded || !model->vocab_tokens) {
+        const unsigned char* p = (const unsigned char*)text;
+        while (*p && count < max_tokens) { tokens[count++] = 3 + *p; p++; }
+        return count;
+    }
+    int norm_sz = (int)strlen(text) * 4 + 16;
+    char* norm = malloc(norm_sz);
+    sp_normalize(text, norm, norm_sz);
     int vocab_size = model->config.vocab_size;
-    int hidden_size = model->config.hidden_size;
-    
-    /* Safety check - if model doesn't have required weights, return error */
-    int has_weights = 1;
-    for (int l = 0; l < model->config.num_layers && l < 2; l++) {
-        if (!model->gate_proj[l] || !model->up_proj[l] || !model->down_proj[l]) {
-            has_weights = 0;
-            break;
+    const char* p = norm;
+    while (*p && count < max_tokens) {
+        int best_len = 0, best_id = -1;
+        for (int v = 0; v < vocab_size; v++) {
+            const char* tok = model->vocab_tokens[v];
+            if (!tok || !tok[0]) continue;
+            if ((unsigned char)tok[0] != (unsigned char)*p) continue;
+            int tlen = (int)strlen(tok);
+            if (tlen > best_len && strncmp(p, tok, tlen) == 0) { best_len = tlen; best_id = v; }
         }
-    }
-    
-    if (!has_weights) {
-        printf("[Error: Model weights not fully loaded]\n");
-        /* Return dummy tokens */
-        for (int i = 0; i < max_output && i < 5; i++) {
-            output_tokens[i] = 100 + i;
-        }
-        return 5;
-    }
-    
-    /* Allocate buffers */
-    float* logits = (float*)aligned_malloc(vocab_size * sizeof(float), 64);
-    int* context = (int*)malloc(2048 * sizeof(int));
-    int context_len = num_prompt;
-    
-    /* Copy prompt to context */
-    for (int i = 0; i < num_prompt && i < 2048; i++) {
-        context[i] = prompt_tokens[i];
-    }
-    
-    int generated = 0;
-    
-    printf("[");
-    fflush(stdout);
-    
-    for (int i = 0; i < max_output; i++) {
-        /* Call REAL model forward pass */
-        int next_token = 0;
-        model_forward(model, context, context_len, logits, &next_token);
-        
-        /* Apply temperature sampling */
-        if (temperature != 1.0f && temperature > 0) {
-            float max_logit = logits[0];
-            for (int v = 1; v < vocab_size; v++) {
-                if (logits[v] > max_logit) max_logit = logits[v];
-            }
-            
-            float probs[32000];
-            float sum = 0.0f;
+        if (best_len > 0 && best_id >= 0) { tokens[count++] = best_id; p += best_len; }
+        else {
+            unsigned char ch = (unsigned char)*p;
+            int found = 0;
             for (int v = 0; v < vocab_size; v++) {
-                probs[v] = expf((logits[v] - max_logit) / temperature);
-                sum += probs[v];
+                const char* tok = model->vocab_tokens[v];
+                if (tok && strlen(tok) == 1 && (unsigned char)tok[0] == ch) { tokens[count++] = v; found = 1; break; }
             }
-            
-            float r = (float)rand() / RAND_MAX * sum;
-            float cumsum = 0.0f;
-            for (int v = 0; v < vocab_size; v++) {
-                cumsum += probs[v];
-                if (cumsum >= r) {
-                    next_token = v;
-                    break;
-                }
-            }
-        }
-        
-        output_tokens[i] = next_token;
-        generated++;
-        
-        /* Add to context */
-        if (context_len < 2048) {
-            context[context_len++] = next_token;
-        } else {
-            memmove(context, context + 64, (context_len - 64) * sizeof(int));
-            context_len -= 64;
-            context[context_len++] = next_token;
-        }
-        
-        /* Progress */
-        if ((i + 1) % (max_output / 10) == 0) {
-            printf("=");
-            fflush(stdout);
-        }
-        
-        /* Stop on EOS */
-        if (next_token == 2 || next_token == 32000) {
-            break;
+            if (!found) tokens[count++] = 3 + ch;
+            p++;
         }
     }
-    
-    printf("]\n");
-    
-    free(context);
-    aligned_free(logits);
-    
-    return generated;
+    free(norm);
+    return count;
 }
 
-/* Print banner */
-void print_banner(void) {
-    printf("\n");
-    printf("========================================\n");
-    printf("       FAST LLM - REAL AI CHAT         \n");
-    printf("========================================\n");
-    printf("\n");
-    printf("Commands:\n");
-    printf("  /help      - Show this help\n");
-    printf("  /reset     - Reset conversation\n");
-    printf("  /stats     - Show model stats\n");
-    printf("  /layers N  - Set layer count (20/24/32)\n");
-    printf("  /quit      - Exit\n");
-    printf("\n");
+/* Detect chat template: 1=Phi3/Llama3, 2=ChatML, 3=Llama2, 0=none */
+static int detect_template(transformer_model_t* model) {
+    if (!model->vocab_loaded || !model->vocab_tokens) return 0;
+    if (find_special_token(model, "<|user|>") >= 0 || find_special_token(model, "<|start_header_id|>") >= 0) return 1;
+    if (find_special_token(model, "<|im_start|>") >= 0) return 2;
+    if (find_special_token(model, "[INST]") >= 0) return 3;
+    return 0;
 }
 
-/* Main chat loop */
-int main(int argc, char* argv[]) {
-    srand((unsigned)time(NULL));
-    
-    print_banner();
-    
-    /* Initialize vocabulary */
-    init_vocab();
-    printf("Tokenizer ready: %d tokens\n", VOCAB_SIZE);
-    
-    /* Load model */
-    transformer_model_t* model = NULL;
-    
-    if (argc > 1) {
-        printf("Loading model: %s\n", argv[1]);
-        model = model_load_gguf(argv[1], 1);  /* use_int8=1 */
-        
-        if (model) {
-            printf("Model loaded!\n");
-            model_print_info(model);
-            
-            /* Default to 24 layers for speed */
-            g_max_layers = 24;
-            printf("Using %d layers for optimal speed\n", g_max_layers);
+/* Full tokenization with chat template */
+static int tokenize_chat(transformer_model_t* model, const char* user_msg, int* tokens, int max_tokens) {
+    int count = 0;
+    tokens[count++] = 1; /* BOS */
+    int tmpl = detect_template(model);
+
+    if (tmpl == 1) {
+        if (find_special_token(model, "<|user|>") >= 0) {
+            count = append_special(model, "<|user|>", tokens, count, max_tokens);
+            char* w = malloc(strlen(user_msg) + 4); sprintf(w, "\n%s", user_msg);
+            count += tokenize_raw(model, w, tokens + count, max_tokens - count); free(w);
+            count = append_special(model, "<|end|>", tokens, count, max_tokens);
+            count = append_special(model, "<|assistant|>", tokens, count, max_tokens);
         } else {
-            printf("ERROR: Failed to load model!\n");
-            printf("Falling back to simulation mode (not functional)\n");
+            count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
+            count += tokenize_raw(model, "user", tokens + count, max_tokens - count);
+            count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
+            char* w = malloc(strlen(user_msg) + 4); sprintf(w, "\n%s", user_msg);
+            count += tokenize_raw(model, w, tokens + count, max_tokens - count); free(w);
+            count = append_special(model, "<|eot_id|>", tokens, count, max_tokens);
+            count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
+            count += tokenize_raw(model, "assistant", tokens + count, max_tokens - count);
+            count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
         }
+    } else if (tmpl == 2) {
+        count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
+        char* w = malloc(strlen(user_msg) + 16); sprintf(w, "user\n%s", user_msg);
+        count += tokenize_raw(model, w, tokens + count, max_tokens - count); free(w);
+        count = append_special(model, "<|im_end|>", tokens, count, max_tokens);
+        count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
+        count += tokenize_raw(model, "assistant\n", tokens + count, max_tokens - count);
+    } else if (tmpl == 3) {
+        int id = find_special_token(model, "[INST]");
+        int eid = find_special_token(model, "[/INST]");
+        if (id >= 0) tokens[count++] = id;
+        char* w = malloc(strlen(user_msg) + 4); sprintf(w, " %s ", user_msg);
+        count += tokenize_raw(model, w, tokens + count, max_tokens - count); free(w);
+        if (eid >= 0) tokens[count++] = eid;
     } else {
-        printf("Usage: chat.exe <model.gguf>\n");
-        printf("No model specified. Exiting.\n");
-        return 1;
+        count += tokenize_raw(model, user_msg, tokens + count, max_tokens - count);
     }
-    
-    printf("\n");
-    
-    /* Chat history */
-    int history[4096];
-    int history_len = 0;
-    
+    return count;
+}
+
+/* Detokenize token IDs back to text */
+static int detokenize(transformer_model_t* model, const int* tokens, int ntok, char* out, int osz) {
+    int pos = 0; out[0] = '\0';
+    if (!model->vocab_loaded || !model->vocab_tokens) {
+        snprintf(out, osz, "[no tokenizer - %d tokens]", ntok);
+        return (int)strlen(out);
+    }
+    for (int i = 0; i < ntok && pos < osz - 1; i++) {
+        int id = tokens[i];
+        if (id <= 0 || id == 1 || id == 2) continue;
+        if (id >= model->config.vocab_size) continue;
+        const char* tok = model->vocab_tokens[id];
+        if (!tok) continue;
+        const char* p = tok;
+        while (*p && pos < osz - 1) {
+            if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81) {
+                out[pos++] = ' '; p += 3;
+            } else { out[pos++] = *p++; }
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+/* ── Sampling ─────────────────────────────────────────────────────── */
+
+static uint32_t g_rng = 0;
+static uint32_t rng_next(void) {
+    if (!g_rng) g_rng = (uint32_t)time(NULL) ^ 0xDEADBEEF;
+    g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5;
+    return g_rng;
+}
+static float rng_float(void) { return (float)(rng_next() & 0xFFFFFF) / (float)0xFFFFFF; }
+
+static int sample_token(float* logits, int vocab, float temperature, int top_k,
+                        float rep_penalty, const int* recent, int n_recent) {
+    if (rep_penalty > 1.0f && recent && n_recent > 0) {
+        for (int i = 0; i < n_recent; i++) {
+            int t = recent[i];
+            if (t >= 0 && t < vocab) {
+                if (logits[t] > 0) logits[t] /= rep_penalty;
+                else logits[t] *= rep_penalty;
+            }
+        }
+    }
+    if (temperature < 0.01f) {
+        float best = logits[0]; int bid = 0;
+        for (int v = 1; v < vocab; v++) if (logits[v] > best) { best = logits[v]; bid = v; }
+        return bid;
+    }
+    for (int v = 0; v < vocab; v++) logits[v] /= temperature;
+    int k = (top_k > 0 && top_k < vocab) ? top_k : 40;
+    float threshold = -1e30f;
+    if (k < vocab) {
+        float* topk = malloc(k * sizeof(float));
+        for (int i = 0; i < k; i++) topk[i] = -1e30f;
+        float hmin = -1e30f;
+        for (int v = 0; v < vocab; v++) {
+            if (logits[v] > hmin) {
+                int mi = 0; for (int j = 1; j < k; j++) if (topk[j] < topk[mi]) mi = j;
+                topk[mi] = logits[v];
+                hmin = topk[0]; for (int j = 1; j < k; j++) if (topk[j] < hmin) hmin = topk[j];
+            }
+        }
+        threshold = hmin; free(topk);
+    }
+    float mx = -1e30f;
+    for (int v = 0; v < vocab; v++) if (logits[v] >= threshold && logits[v] > mx) mx = logits[v];
+    float sum = 0;
+    for (int v = 0; v < vocab; v++) {
+        if (logits[v] >= threshold) { logits[v] = expf(logits[v] - mx); sum += logits[v]; }
+        else logits[v] = 0;
+    }
+    if (sum <= 0) { float best = logits[0]; int bid = 0; for (int v = 1; v < vocab; v++) if (logits[v] > best) { best = logits[v]; bid = v; } return bid; }
+    for (int v = 0; v < vocab; v++) logits[v] /= sum;
+    float r = rng_float(), cs = 0;
+    for (int v = 0; v < vocab; v++) { cs += logits[v]; if (cs >= r) return v; }
+    return vocab - 1;
+}
+
+/* ── Main ─────────────────────────────────────────────────────────── */
+
+void print_banner(void) {
+    printf("\n========================================\n");
+    printf("       FAST LLM - REAL AI CHAT         \n");
+    printf("========================================\n\n");
+    printf("Commands: /help /reset /stats /layers N /quit\n\n");
+}
+
+int main(int argc, char* argv[]) {
+    print_banner();
+
+    if (argc < 2) { printf("Usage: chat <model.gguf>\n"); return 1; }
+
+    printf("Loading model: %s\n", argv[1]);
+    transformer_model_t* model = model_load_gguf(argv[1], 1);
+    if (!model) { printf("ERROR: Failed to load model!\n"); return 1; }
+
+    model_print_info(model);
+    g_max_layers = model->config.num_layers;
+
+    float temperature = 0.7f;
+    int top_k = 40;
+    float rep_penalty = 1.1f;
+    int max_gen = 256;
+
+    /* Detect EOS tokens */
+    int eos_ids[8] = {2, -1, -1, -1, -1, -1, -1, -1};
+    int n_eos = 1;
+    const char* eos_names[] = {"<|end|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>", "</s>", "<|end_of_text|>", NULL};
+    for (int i = 0; eos_names[i] && n_eos < 8; i++) {
+        int id = find_special_token(model, eos_names[i]);
+        if (id >= 0) eos_ids[n_eos++] = id;
+    }
+
+    printf("Ready! Type your message.\n\n");
+
     char input[1024];
-    int input_tokens[256];
-    int output_tokens[256];
-    char response[2048];
-    
-    printf("Assistant: Hello! I'm a real AI running on your CPU. What would you like to talk about?\n\n");
-    
     while (1) {
-        printf("You: ");
-        fflush(stdout);
-        
+        printf("You: "); fflush(stdout);
         if (!fgets(input, sizeof(input), stdin)) break;
-        
-        /* Remove newline */
         input[strcspn(input, "\n")] = 0;
-        
-        /* Handle commands */
+        if (!input[0]) continue;
+
         if (input[0] == '/') {
-            if (strcmp(input, "/quit") == 0 || strcmp(input, "/exit") == 0) {
-                printf("\nGoodbye!\n");
-                break;
-            } else if (strcmp(input, "/help") == 0) {
-                print_banner();
-                continue;
-            } else if (strcmp(input, "/reset") == 0) {
-                history_len = 0;
-                printf("Conversation reset.\n\n");
-                continue;
-            } else if (strcmp(input, "/stats") == 0) {
-                if (model) {
-                    model_print_info(model);
-                    printf("Active layers: %d\n\n", g_max_layers);
-                }
-                continue;
-            } else if (strncmp(input, "/layers ", 8) == 0) {
-                int layers = atoi(input + 8);
-                if (layers >= 8 && layers <= 32) {
-                    g_max_layers = layers;
-                    printf("Set to %d layers.\n\n", layers);
-                } else {
-                    printf("Invalid layer count. Use 8-32.\n\n");
-                }
+            if (strcmp(input, "/quit") == 0 || strcmp(input, "/exit") == 0) { printf("\nGoodbye!\n"); break; }
+            if (strcmp(input, "/help") == 0) { print_banner(); continue; }
+            if (strcmp(input, "/stats") == 0) { model_print_info(model); continue; }
+            if (strncmp(input, "/layers ", 8) == 0) {
+                int l = atoi(input + 8);
+                if (l >= 1 && l <= model->config.num_layers) { g_max_layers = l; printf("Using %d layers.\n\n", l); }
+                else printf("Invalid (1-%d).\n\n", model->config.num_layers);
                 continue;
             }
+            if (strcmp(input, "/reset") == 0) { printf("Conversation reset.\n\n"); continue; }
+            printf("Unknown command.\n\n"); continue;
         }
-        
-        if (strlen(input) == 0) continue;
-        
-        /* Tokenize */
-        int num_input = tokenize(input, input_tokens, 256);
-        
-        /* Add to history */
-        if (history_len + num_input < 4096) {
-            for (int i = 0; i < num_input; i++) {
-                history[history_len++] = input_tokens[i];
-            }
-        }
-        
-        /* Generate with REAL model */
-        printf("Assistant: ");
-        fflush(stdout);
-        
-        if (model) {
-            int num_output = generate_real(model, input_tokens, num_input,
-                                           output_tokens, 100, 0.8f);
-            
-            /* Detokenize and print */
-            detokenize(output_tokens, num_output, response, sizeof(response));
-            printf("%s\n\n", response);
-            
-            /* Add to history */
-            if (history_len + num_output < 4096) {
-                for (int i = 0; i < num_output; i++) {
-                    history[history_len++] = output_tokens[i];
+
+        /* Tokenize with chat template */
+        int ctx[4096];
+        int ctx_len = tokenize_chat(model, input, ctx, 1024);
+
+        int vocab = model->config.vocab_size;
+        float* logits = aligned_malloc(vocab * sizeof(float), 64);
+        int out_tokens[512];
+        int gen = 0;
+
+        printf("Assistant: "); fflush(stdout);
+
+        for (int t = 0; t < max_gen; t++) {
+            int next = 0;
+            model_forward(model, ctx, ctx_len, logits, &next);
+            next = sample_token(logits, vocab, temperature, top_k, rep_penalty, out_tokens, gen);
+
+            if (ctx_len < 4096) ctx[ctx_len++] = next;
+            else { memmove(ctx, ctx + 64, (ctx_len - 64) * sizeof(int)); ctx_len -= 64; ctx[ctx_len++] = next; }
+
+            out_tokens[gen++] = next;
+
+            /* Print token as it's generated (streaming) */
+            if (model->vocab_loaded && model->vocab_tokens && next > 2 && next < vocab) {
+                const char* tok = model->vocab_tokens[next];
+                if (tok) {
+                    const char* p = tok;
+                    while (*p) {
+                        if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x96 && (unsigned char)p[2] == 0x81) {
+                            putchar(' '); p += 3;
+                        } else { putchar(*p); p++; }
+                    }
+                    fflush(stdout);
                 }
             }
-        } else {
-            printf("[Model not loaded - cannot generate]\n\n");
+
+            /* Check EOS */
+            int is_eos = 0;
+            for (int e = 0; e < n_eos; e++) if (next == eos_ids[e]) { is_eos = 1; break; }
+            if (is_eos) break;
+            if (gen >= 5) {
+                int same = 1;
+                for (int r = 1; r < 5; r++) if (out_tokens[gen-1-r] != out_tokens[gen-1]) { same = 0; break; }
+                if (same) break;
+            }
         }
+
+        printf("\n\n");
+        aligned_free(logits);
     }
-    
-    /* Cleanup */
-    for (int i = 0; i < VOCAB_SIZE; i++) {
-        if (vocab[i]) free(vocab[i]);
-    }
-    
-    if (model) model_free(model);
-    
+
+    model_free(model);
     return 0;
 }
