@@ -177,109 +177,108 @@ static int append_special(transformer_model_t* model, const char* tag, int* toke
 
 /*
  * BPE-style tokenize: greedy longest match against vocab.
- * Handles both SentencePiece (▁) and BPE (Ġ) space conventions.
- * For plain tokenizers (no space prefix), matches raw text directly.
+ * Handles both SentencePiece and BPE space conventions.
+ *
+ * BPE convention (Llama 3, GPT-2): spaces in text become the Ġ prefix on tokens.
+ *   "hello world" → [Ġhello, Ġworld]  (each word starts with Ġ)
+ *   "\nhello" → [\n, Ġhello]  (newline is its own token, no prefix)
+ *
+ * We normalize by replacing spaces with the prefix character, then do greedy match.
+ * The first word gets a prefix only if it starts with a letter/digit (not \n or punctuation).
  */
+/*
+ * GPT-2 byte-to-unicode mapping for BPE tokenizers.
+ * Converts a raw byte to its BPE Unicode representation (UTF-8 encoded).
+ * E.g., newline (0x0A) -> U+010A (UTF-8: 0xC4 0x8A)
+ *        space (0x20)   -> U+0120 (UTF-8: 0xC4 0xA0)
+ */
+static int bpe_byte_to_utf8(unsigned char byte, char* out) {
+    static int init = 0;
+    static uint16_t map[256];
+    if (!init) {
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255))
+                map[b] = (uint16_t)b;
+            else { map[b] = (uint16_t)(256 + n); n++; }
+        }
+        init = 1;
+    }
+    uint16_t cp = map[byte];
+    if (cp < 0x80) { out[0] = (char)cp; return 1; }
+    out[0] = (char)(0xC0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3F));
+    return 2;
+}
+
 static int real_tokenize_raw(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
     int count = 0;
-
     if (!model->vocab_loaded || !model->vocab_tokens) {
-        /* Fallback: byte-level encoding using low token IDs */
         const unsigned char* p = (const unsigned char*)text;
-        while (*p && count < max_tokens - 1) {
-            tokens[count++] = 3 + *p;
-            p++;
-        }
+        while (*p && count < max_tokens - 1) { tokens[count++] = 3 + *p; p++; }
         return count;
     }
 
     int tok_type = detect_tokenizer_type(model);
-    const char* space_prefix = NULL;
-    int space_prefix_len = 0;
-
-    if (tok_type == 1) {
-        space_prefix = SP_SPACE;
-        space_prefix_len = SP_SPACE_LEN;
-    } else if (tok_type == 2) {
-        space_prefix = BPE_SPACE;
-        space_prefix_len = BPE_SPACE_LEN;
-    }
-
-    /* Normalize text: convert spaces to the tokenizer's space prefix */
-    char* normalized = NULL;
+    char* encoded = NULL;
     const char* match_text = text;
 
-    if (space_prefix) {
+    if (tok_type == 2) {
+        /* BPE: encode each byte through GPT-2 byte-to-unicode mapping */
+        int enc_sz = (int)strlen(text) * 3 + 16;
+        encoded = malloc(enc_sz);
+        int pos = 0;
+        const unsigned char* p = (const unsigned char*)text;
+        while (*p && pos < enc_sz - 4) {
+            char buf[4];
+            int n = bpe_byte_to_utf8(*p, buf);
+            for (int i = 0; i < n; i++) encoded[pos++] = buf[i];
+            p++;
+        }
+        encoded[pos] = '\0';
+        match_text = encoded;
+    } else if (tok_type == 1) {
+        /* SentencePiece: spaces become the SP prefix */
         int norm_sz = (int)strlen(text) * 4 + 16;
-        normalized = malloc(norm_sz);
+        encoded = malloc(norm_sz);
         int pos = 0;
         const char* p = text;
-
-        /* Prepend space prefix to first word (standard for both SP and BPE) */
-        if (*p && *p != ' ') {
-            memcpy(normalized + pos, space_prefix, space_prefix_len);
-            pos += space_prefix_len;
+        if (*p && *p != ' ' && *p != '\n' && (unsigned char)*p >= 32) {
+            memcpy(encoded + pos, SP_SPACE, SP_SPACE_LEN); pos += SP_SPACE_LEN;
         }
-
         while (*p && pos < norm_sz - 4) {
-            if (*p == ' ') {
-                memcpy(normalized + pos, space_prefix, space_prefix_len);
-                pos += space_prefix_len;
-                p++;
-            } else {
-                normalized[pos++] = *p++;
-            }
+            if (*p == ' ') { memcpy(encoded + pos, SP_SPACE, SP_SPACE_LEN); pos += SP_SPACE_LEN; p++; }
+            else { encoded[pos++] = *p++; }
         }
-        normalized[pos] = '\0';
-        match_text = normalized;
+        encoded[pos] = '\0';
+        match_text = encoded;
     }
 
     int vocab_size = model->config.vocab_size;
     const char* p = match_text;
 
     while (*p && count < max_tokens - 1) {
-        int best_len = 0;
-        int best_id = -1;
-
-        /* Greedy longest-match against vocabulary */
+        int best_len = 0, best_id = -1;
         for (int v = 0; v < vocab_size; v++) {
             const char* tok = model->vocab_tokens[v];
             if (!tok || tok[0] == '\0') continue;
-
-            /* Quick first-byte filter */
             if ((unsigned char)tok[0] != (unsigned char)*p) continue;
-
             int tlen = (int)strlen(tok);
-            if (tlen > best_len && strncmp(p, tok, tlen) == 0) {
-                best_len = tlen;
-                best_id = v;
-            }
+            if (tlen > best_len && strncmp(p, tok, tlen) == 0) { best_len = tlen; best_id = v; }
         }
-
-        if (best_len > 0 && best_id >= 0) {
-            tokens[count++] = best_id;
-            p += best_len;
-        } else {
-            /* Single byte fallback — try to find a byte token */
-            int found = 0;
+        if (best_len > 0 && best_id >= 0) { tokens[count++] = best_id; p += best_len; }
+        else {
             unsigned char ch = (unsigned char)*p;
+            int found = 0;
             for (int v = 0; v < vocab_size; v++) {
                 const char* tok = model->vocab_tokens[v];
-                if (tok && strlen(tok) == 1 && (unsigned char)tok[0] == ch) {
-                    tokens[count++] = v;
-                    found = 1;
-                    break;
-                }
+                if (tok && strlen(tok) == 1 && (unsigned char)tok[0] == ch) { tokens[count++] = v; found = 1; break; }
             }
-            if (!found) {
-                /* Last resort: use byte value + 3 as token ID */
-                tokens[count++] = 3 + ch;
-            }
+            if (!found) tokens[count++] = 3 + ch;
             p++;
         }
     }
-
-    if (normalized) free(normalized);
+    if (encoded) free(encoded);
     return count;
 }
 
@@ -308,67 +307,66 @@ static int detect_template(transformer_model_t* model) {
 
 /*
  * Full tokenization with chat template wrapping.
- * Produces: BOS + template_header + user_message + template_footer
+ * Produces properly formatted prompt for the model's chat template.
  */
 static int real_tokenize(transformer_model_t* model, const char* text, int* tokens, int max_tokens) {
     int count = 0;
-    tokens[count++] = 1; /* BOS */
+
+    /* BOS token — use model-specific if available */
+    int bos = find_special_token(model, "<|begin_of_text|>");
+    if (bos >= 0) tokens[count++] = bos;
+    else tokens[count++] = 1;
 
     int tmpl = detect_template(model);
     fprintf(stderr, "[tokenize] template=%d\n", tmpl);
 
     if (tmpl == 1) {
-        /* Llama 3 / Phi-3 style:
-         * <|user|>\n{message}<|end|>\n<|assistant|>\n
-         * OR: <|start_header_id|>user<|end_header_id|>\n{message}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n
-         */
         if (find_special_token(model, "<|user|>") >= 0) {
-            /* Phi-3 style */
+            /* Phi-3 style: <|user|>\n{message}<|end|>\n<|assistant|>\n */
             count = append_special(model, "<|user|>", tokens, count, max_tokens);
-            /* Tokenize "\n" + message */
-            char* wrapped = malloc(strlen(text) + 4);
-            sprintf(wrapped, "\n%s", text);
-            count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
-            free(wrapped);
+            count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
+            count += real_tokenize_raw(model, text, tokens + count, max_tokens - count);
             count = append_special(model, "<|end|>", tokens, count, max_tokens);
+            count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
             count = append_special(model, "<|assistant|>", tokens, count, max_tokens);
+            count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
         } else {
-            /* Llama 3 style */
+            /* Llama 3 style:
+             * <|start_header_id|>user<|end_header_id|>\n\n{message}<|eot_id|>
+             * <|start_header_id|>assistant<|end_header_id|>\n\n */
             count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
             count += real_tokenize_raw(model, "user", tokens + count, max_tokens - count);
             count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
-            char* wrapped = malloc(strlen(text) + 4);
-            sprintf(wrapped, "\n%s", text);
-            count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
-            free(wrapped);
+            /* Two newlines after end_header_id */
+            count += real_tokenize_raw(model, "\n\n", tokens + count, max_tokens - count);
+            /* User message (gets BPE space prefix automatically) */
+            count += real_tokenize_raw(model, text, tokens + count, max_tokens - count);
             count = append_special(model, "<|eot_id|>", tokens, count, max_tokens);
             count = append_special(model, "<|start_header_id|>", tokens, count, max_tokens);
             count += real_tokenize_raw(model, "assistant", tokens + count, max_tokens - count);
             count = append_special(model, "<|end_header_id|>", tokens, count, max_tokens);
+            /* Two newlines to start assistant response */
+            count += real_tokenize_raw(model, "\n\n", tokens + count, max_tokens - count);
         }
     } else if (tmpl == 2) {
-        /* ChatML style:
-         * <|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n
-         */
+        /* ChatML: <|im_start|>user\n{message}<|im_end|>\n<|im_start|>assistant\n */
         count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
-        char* wrapped = malloc(strlen(text) + 16);
-        sprintf(wrapped, "user\n%s", text);
-        count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
-        free(wrapped);
+        count += real_tokenize_raw(model, "user", tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, text, tokens + count, max_tokens - count);
         count = append_special(model, "<|im_end|>", tokens, count, max_tokens);
+        count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
         count = append_special(model, "<|im_start|>", tokens, count, max_tokens);
-        count += real_tokenize_raw(model, "assistant\n", tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, "assistant", tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, "\n", tokens + count, max_tokens - count);
     } else if (tmpl == 3) {
-        /* Llama 2 style:
-         * [INST] {message} [/INST]
-         */
+        /* Llama 2: [INST] {message} [/INST] */
         int inst_id = find_special_token(model, "[INST]");
         int inst_end_id = find_special_token(model, "[/INST]");
         if (inst_id >= 0) tokens[count++] = inst_id;
-        char* wrapped = malloc(strlen(text) + 4);
-        sprintf(wrapped, " %s ", text);
-        count += real_tokenize_raw(model, wrapped, tokens + count, max_tokens - count);
-        free(wrapped);
+        count += real_tokenize_raw(model, " ", tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, text, tokens + count, max_tokens - count);
+        count += real_tokenize_raw(model, " ", tokens + count, max_tokens - count);
         if (inst_end_id >= 0) tokens[count++] = inst_end_id;
     } else {
         /* No template detected — just tokenize the raw text */
