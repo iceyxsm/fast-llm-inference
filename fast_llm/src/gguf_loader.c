@@ -179,107 +179,102 @@ static float f16_to_f32(uint16_t h) {
     return result;
 }
 
+/* Helper: unpack scale and min for Q4_K/Q5_K (matches llama.cpp get_scale_min_k4) */
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
 /* 
- * Dequantize Q4_K to float (proper implementation based on llama.cpp)
- * 256 weights per super-block, 8 sub-blocks of 32 weights each
+ * Dequantize Q4_K to float — matches llama.cpp dequantize_row_q4_K exactly
+ * 256 weights per super-block, 8 sub-blocks of 32 weights
  */
 static void dequantize_q4_K(const void* src, float* dst, int n) {
-    const block_q4_K* blocks = (const block_q4_K*)src;
+    const block_q4_K* x = (const block_q4_K*)src;
     int num_blocks = n / 256;
 
-    for (int b = 0; b < num_blocks; b++) {
-        float d = f16_to_f32(blocks[b].d);
-        float dmin = f16_to_f32(blocks[b].dmin);
-        const uint8_t* sc = blocks[b].scales;
-
-        /* Unpack 6-bit scales and mins from 12 bytes */
-        uint8_t scales[8], mins[8];
-        for (int i = 0; i < 4; i++) {
-            scales[2*i]   = sc[i] & 63;
-            scales[2*i+1] = sc[i+4] & 63;
-            mins[2*i]     = sc[i] >> 6 | ((sc[i+8] & 0x0F) << 2);
-            mins[2*i+1]   = sc[i+4] >> 6 | ((sc[i+8] >> 4) << 2);
-        }
-
-        /* Dequantize 8 sub-blocks of 32 weights */
-        for (int j = 0; j < 8; j++) {
-            float sc_val = d * scales[j];
-            float mn_val = dmin * mins[j];
-            for (int k = 0; k < 16; k++) {
-                uint8_t q = blocks[b].qs[j*16 + k];
-                dst[b*256 + j*32 + k]      = sc_val * (q & 0xF) - mn_val;
-                dst[b*256 + j*32 + k + 16] = sc_val * (q >> 4) - mn_val;
-            }
+    for (int i = 0; i < num_blocks; i++) {
+        const uint8_t* q = x[i].qs;
+        float d   = f16_to_f32(x[i].d);
+        float min = f16_to_f32(x[i].dmin);
+        int is = 0;
+        float* y = dst + i * 256;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            float d1 = d * sc; float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            float d2 = d * sc; float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l]  >> 4) - m2;
+            q += 32; is += 2;
         }
     }
 }
 
 /*
- * Dequantize Q5_K to float
- * 256 weights per super-block, 5-bit quantization
+ * Dequantize Q5_K to float — matches llama.cpp dequantize_row_q5_K exactly
  */
 static void dequantize_q5_K(const void* src, float* dst, int n) {
-    const block_q5_K* blocks = (const block_q5_K*)src;
+    const block_q5_K* x = (const block_q5_K*)src;
     int num_blocks = n / 256;
 
-    for (int b = 0; b < num_blocks; b++) {
-        float d = f16_to_f32(blocks[b].d);
-        float dmin = f16_to_f32(blocks[b].dmin);
-        const uint8_t* sc = blocks[b].scales;
-
-        /* Unpack 6-bit scales and mins (same as Q4_K) */
-        uint8_t scales[8], mins[8];
-        for (int i = 0; i < 4; i++) {
-            scales[2*i]   = sc[i] & 63;
-            scales[2*i+1] = sc[i+4] & 63;
-            mins[2*i]     = sc[i] >> 6 | ((sc[i+8] & 0x0F) << 2);
-            mins[2*i+1]   = sc[i+4] >> 6 | ((sc[i+8] >> 4) << 2);
-        }
-
-        /* Dequantize: low 4 bits from qs, high bit from qh */
-        for (int j = 0; j < 8; j++) {
-            float sc_val = d * scales[j];
-            float mn_val = dmin * mins[j];
-            for (int k = 0; k < 16; k++) {
-                uint8_t q = blocks[b].qs[j*16 + k];
-                int idx0 = j*32 + k;
-                int idx1 = j*32 + k + 16;
-                /* Get high bits from qh */
-                int h0 = (blocks[b].qh[idx0 / 8] >> (idx0 % 8)) & 1;
-                int h1 = (blocks[b].qh[idx1 / 8] >> (idx1 % 8)) & 1;
-                dst[b*256 + idx0] = sc_val * ((q & 0xF) | (h0 << 4)) - mn_val;
-                dst[b*256 + idx1] = sc_val * ((q >> 4) | (h1 << 4)) - mn_val;
-            }
+    for (int i = 0; i < num_blocks; i++) {
+        const uint8_t* ql = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        float d   = f16_to_f32(x[i].d);
+        float min = f16_to_f32(x[i].dmin);
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        float* y = dst + i * 256;
+        for (int j = 0; j < 256; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            float d1 = d * sc; float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            float d2 = d * sc; float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l]  >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
         }
     }
 }
 
 /*
- * Dequantize Q6_K to float
- * 256 weights per super-block, 6-bit quantization
+ * Dequantize Q6_K to float — matches llama.cpp dequantize_row_q6_K exactly
  */
 static void dequantize_q6_K(const void* src, float* dst, int n) {
-    const block_q6_K* blocks = (const block_q6_K*)src;
+    const block_q6_K* x = (const block_q6_K*)src;
     int num_blocks = n / 256;
 
-    for (int b = 0; b < num_blocks; b++) {
-        float d = f16_to_f32(blocks[b].d);
-
-        /* 16 sub-blocks of 16 weights, each with an 8-bit scale */
-        for (int j = 0; j < 16; j++) {
-            float sc = d * blocks[b].scales[j];
-            for (int k = 0; k < 16; k++) {
-                int idx = j*16 + k;
-                /* Lower 4 bits from ql */
-                int ql = blocks[b].ql[idx / 2];
-                int q4 = (idx % 2 == 0) ? (ql & 0xF) : (ql >> 4);
-                /* Upper 2 bits from qh */
-                int qh = blocks[b].qh[idx / 4];
-                int q2 = (qh >> (2 * (idx % 4))) & 3;
-                /* Combine to 6-bit value, centered at 32 */
-                int q = q4 | (q2 << 4);
-                dst[b*256 + idx] = sc * (q - 32);
+    for (int i = 0; i < num_blocks; i++) {
+        float d = f16_to_f32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t*  sc = x[i].scales;
+        float* y = dst + i * 256;
+        for (int nn = 0; nn < 256; nn += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
             }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
         }
     }
 }
@@ -566,12 +561,18 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                    (unsigned long long)tensors[i].size);
         }
         
-        /* Get dimensions — GGUF dims[0] and dims[1] as stored in the file.
-         * For weight matrices, the data is dequantized into a flat array of
-         * rows*cols floats. We store as [out_dim, in_dim] for matvec. */
-        int rows = (tensors[i].n_dims > 0) ? tensors[i].dims[0] : 1;
-        int cols = (tensors[i].n_dims > 1) ? tensors[i].dims[1] : 1;
-        int num_elems_1d = (tensors[i].n_dims == 1) ? rows : rows;
+        /* Get dimensions — GGUF convention:
+         *   dims[0] = ne[0] = contiguous dimension = number of elements per row
+         *   dims[1] = ne[1] = number of rows
+         * For weight matrices: ne[0] = in_features, ne[1] = out_features
+         * In memory: ne[1] rows of ne[0] elements = [out_features, in_features]
+         * For 1D tensors (norms): dims[0] = vector length
+         */
+        int ne0 = (tensors[i].n_dims > 0) ? tensors[i].dims[0] : 1;  /* contiguous dim */
+        int ne1 = (tensors[i].n_dims > 1) ? tensors[i].dims[1] : 1;  /* rows */
+        int rows = ne0;  /* legacy name — actually ne[0] */
+        int cols = ne1;  /* legacy name — actually ne[1] */
+        int num_elems_1d = ne0;  /* for 1D tensors */
         
         /* Dequantize and store based on type */
         if ((tensors[i].type == GGML_TYPE_Q4_0 || 
@@ -579,32 +580,33 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
             tensors[i].type == GGML_TYPE_Q4_1 ||
             tensors[i].type == GGML_TYPE_Q5_K ||
             tensors[i].type == GGML_TYPE_Q6_K) && proj_type == PROJ_EMBED) {
-            /* Special handling for embeddings: dequantize row by row to avoid 1GB allocation */
-            /* GGUF stores as [hidden_size, vocab_size], we need [vocab_size, hidden_size] */
-            int emb_hidden = rows;  /* 2048 */
-            int emb_vocab = cols;   /* 128256 */
+            /* Special handling for embeddings: dequantize row by row
+             * GGUF: ne[0]=hidden_size (contiguous), ne[1]=vocab_size
+             * In memory: vocab_size rows of hidden_size elements = [vocab_size, hidden_size]
+             * We need [vocab_size, hidden_size] for embedding lookup — direct copy! */
+            int emb_hidden = ne0;  /* hidden_size */
+            int emb_vocab = ne1;   /* vocab_size */
             if (emb_hidden > config.hidden_size) emb_hidden = config.hidden_size;
             if (emb_vocab > config.vocab_size) emb_vocab = config.vocab_size;
 
-            /* Dequantize one row at a time (one row = one hidden dim across all vocab) */
-            float* row_buf = aligned_malloc(emb_vocab * sizeof(float), 64);
+            /* Dequantize one row at a time (one row = one token's embedding) */
+            float* row_buf = aligned_malloc(emb_hidden * sizeof(float), 64);
 
-            for (int h = 0; h < emb_hidden; h++) {
-                /* Dequantize row h: block_size elements at a time */
-                const uint8_t* row_data = (const uint8_t*)tensor_data + h * (tensors[i].size / rows);
+            for (int v = 0; v < emb_vocab; v++) {
+                /* Dequantize row v (one token embedding of hidden_size elements) */
+                int row_bytes = tensors[i].size / ne1;
+                const uint8_t* row_data = (const uint8_t*)tensor_data + v * row_bytes;
                 if (tensors[i].type == GGML_TYPE_Q6_K) {
-                    dequantize_q6_K(row_data, row_buf, emb_vocab);
+                    dequantize_q6_K(row_data, row_buf, emb_hidden);
                 } else if (tensors[i].type == GGML_TYPE_Q5_K) {
-                    dequantize_q5_K(row_data, row_buf, emb_vocab);
+                    dequantize_q5_K(row_data, row_buf, emb_hidden);
                 } else if (tensors[i].type == GGML_TYPE_Q4_K) {
-                    dequantize_q4_K(row_data, row_buf, emb_vocab);
+                    dequantize_q4_K(row_data, row_buf, emb_hidden);
                 } else if (tensors[i].type == GGML_TYPE_Q4_0) {
-                    dequantize_q4_0(row_data, row_buf, emb_vocab);
+                    dequantize_q4_0(row_data, row_buf, emb_hidden);
                 }
-                /* Transpose: row h of [hidden, vocab] → column h of [vocab, hidden] */
-                for (int v = 0; v < emb_vocab; v++) {
-                    model->token_embeddings[v * config.hidden_size + h] = row_buf[v];
-                }
+                /* Direct copy — already [vocab, hidden] layout */
+                memcpy(&model->token_embeddings[v * config.hidden_size], row_buf, emb_hidden * sizeof(float));
             }
             aligned_free(row_buf);
             loaded_tensors++;
@@ -630,14 +632,13 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 dequantize_q6_K(tensor_data, f32_data, num_elements);
             }
             
-            /* GGUF stores weight data as [ne[0], ne[1]] in row-major order.
-             * ne[0] = rows (contiguous), ne[1] = cols.
-             * For weight matrices, GGUF convention is ne[0]=out_features, ne[1]=in_features
-             * when the tensor name follows standard patterns.
-             * Our matvec expects [out_dim, in_dim].
-             * We use the tensor dimensions directly — no transpose needed. */
-            int out_dim = rows;
-            int in_dim = cols;
+            /* GGUF weight layout (researched from llama.cpp/ggml):
+             *   ne[0] (=rows var) = in_features (contiguous in memory)
+             *   ne[1] (=cols var) = out_features (number of rows in memory)
+             * Data in memory: ne[1] rows × ne[0] elements = [out_features, in_features]
+             * Our matvec expects [out_dim, in_dim] — matches directly, no transpose. */
+            int out_dim = ne1;  /* ne[1] = out_features */
+            int in_dim = ne0;   /* ne[0] = in_features */
 
             dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
             dt->rows = out_dim;
@@ -788,20 +789,12 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                     continue;
                 }
 
-                /* Copy with transpose if needed */
-                if (rows == config.hidden_size && cols >= config.vocab_size) {
-                    /* Stored as [hidden, vocab] — transpose to [vocab, hidden] */
-                    for (int v = 0; v < emb_vocab; v++) {
-                        for (int h = 0; h < emb_hidden; h++) {
-                            model->token_embeddings[v * config.hidden_size + h] = emb_f32[h * cols + v];
-                        }
-                    }
-                } else {
-                    /* Stored as [vocab, hidden] — direct copy */
-                    for (int v = 0; v < emb_vocab; v++) {
-                        for (int h = 0; h < emb_hidden; h++) {
-                            model->token_embeddings[v * config.hidden_size + h] = emb_f32[v * cols + h];
-                        }
+                /* GGUF embeds: ne[0]=hidden, ne[1]=vocab. Data is [vocab, hidden] in memory.
+                 * dt->f32_weights is [out_dim=ne1, in_dim=ne0] = [vocab, hidden].
+                 * Direct copy to token_embeddings[vocab, hidden]. */
+                for (int v = 0; v < emb_vocab; v++) {
+                    for (int h = 0; h < emb_hidden; h++) {
+                        model->token_embeddings[v * config.hidden_size + h] = emb_f32[v * ne0 + h];
                     }
                 }
                 if (need_free_emb) aligned_free(emb_f32);
@@ -848,21 +841,15 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 memcpy(&f32_data[e], &f, 4);
             }
 
-            /* Handle embeddings (store as float directly, with transpose if needed) */
+            /* Handle embeddings — GGUF: ne[0]=hidden, ne[1]=vocab.
+             * F16 data is [ne1 rows × ne0 elements] = [vocab, hidden] in memory.
+             * Direct copy to token_embeddings[vocab, hidden]. */
             if (proj_type == PROJ_EMBED) {
-                if (rows == config.hidden_size && cols >= config.vocab_size) {
-                    /* [hidden, vocab] -> transpose to [vocab, hidden] */
-                    int ev = cols < config.vocab_size ? cols : config.vocab_size;
-                    for (int v = 0; v < ev; v++)
-                        for (int h = 0; h < rows && h < config.hidden_size; h++)
-                            model->token_embeddings[v * config.hidden_size + h] = f32_data[h * cols + v];
-                } else {
-                    /* [vocab, hidden] -> direct copy */
-                    int ev = rows < config.vocab_size ? rows : config.vocab_size;
-                    for (int v = 0; v < ev; v++)
-                        for (int h = 0; h < cols && h < config.hidden_size; h++)
-                            model->token_embeddings[v * config.hidden_size + h] = f32_data[v * cols + h];
-                }
+                int ev = ne1 < config.vocab_size ? ne1 : config.vocab_size;
+                int eh = ne0 < config.hidden_size ? ne0 : config.hidden_size;
+                for (int v = 0; v < ev; v++)
+                    for (int h = 0; h < eh; h++)
+                        model->token_embeddings[v * config.hidden_size + h] = f32_data[v * ne0 + h];
                 aligned_free(f32_data);
                 loaded_tensors++;
                 total_bytes += num_elements * 2;
@@ -880,10 +867,10 @@ transformer_model_t* model_load_gguf(const char* path, int use_int8) {
                 }
                 aligned_free(f32_data);
             }
-            /* Handle weight matrices — use dimensions directly */
+            /* Handle weight matrices — GGUF: ne[0]=in_features, ne[1]=out_features */
             else {
-                int out_dim = rows;
-                int in_dim = cols;
+                int out_dim = ne1;
+                int in_dim = ne0;
 
                 dequantized_tensor_t* dt = malloc(sizeof(dequantized_tensor_t));
                 dt->rows = out_dim;
